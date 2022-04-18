@@ -5,7 +5,7 @@ NEED PERL >5.2
 Execute in a shell:
 
 
-  curl -L https://raw.githubusercontent.com/g-booking/g-vault/d1210fc9f9f4768ddaba49d0e803357517cf454a/installer/g_vault_install.sh | bash
+  curl -L https://raw.githubusercontent.com/g-booking/g-vault/main/gvault_install-0.90.sh | bash
 
 
 Which works for many LINUX systems but not all... else look at the "manual installation" instructions.

@@ -1,0 +1,118 @@
+#!/usr/local/_gvault/bin/perl
+use v5.20;
+use strict;
+use warnings;
+use Crypt::Mode::CBC;
+use Crypt::Digest::Keccak512   qw( keccak512      );
+use Crypt::Digest::BLAKE2b_256 qw( blake2b_256    );
+use IO::Socket::UNIX;
+use Data::Dump qw (dump);
+
+my $SOCK_PATH = "/usr/local/_gvault/sock/.gvault.sock";
+my $g_two     = Crypt::Mode::CBC->new('TwoFish', 1, 16);
+
+$| = 1;
+
+my $client =  IO::Socket::UNIX->new(
+    Type   => SOCK_STREAM(),
+    Peer   => $SOCK_PATH,
+);
+
+if ( not $client ) {
+  _ERROR ("gVault_send cannot send to [$SOCK_PATH].");
+  exit 1;
+}
+
+if ( $client )  {
+  while ( <> ) {
+    if ( $ENV{_gvss_}  and length($ENV{_gvss_}) == 128 ) {
+      print $client "SES:" . substr($ENV{_gvss_},0,64) . to_hex(enc_data($_)) . "\n";
+    }
+    else {
+      print $client "ENC:" . to_hex(enc_data($_)) . "\n";
+    }
+    last;
+  }
+}
+
+if ( $client ) {
+  while (<$client>) {
+    print $_;
+  }
+}
+ 
+close $client if $client;
+
+sub enc_data  {
+  return if not $_[0];
+  # A simple yet effective encryption between real-time UNIX sockets... uses real-time PID data + some pepper.
+  my ($d, $p)= get_pid_data($$);
+  if ( $ENV{_gvss_} ) {
+    $d = keccak512  ( $d . from_hex(substr($ENV{_gvss_}, 64, 64)) );
+  }
+  else {
+    $d = keccak512  ( $d );
+  }
+  my $secret = substr ($d,  9, 32);
+  my $iv     = substr ($d, 47, 16);
+  return $g_two->encrypt ( $_[0], $secret, $iv );
+}
+
+sub _ERROR {
+  print STDERR "$_[0]" . "\n";
+}
+
+
+
+sub to_hex {
+  return '' if not $_[0];
+  return unpack("H*",  $_[0]) if $_[0];
+  return;
+}
+
+
+sub get_pid_data  {
+  my $pid = $_[0];
+  if ( my $data = load_a_file("/proc/$pid/stat") ) {
+    my @pid_stat = split(/ /, $data, 23);
+    my $data;
+    if ( @pid_stat > 22 ) {
+      $data->{uid}   = load_a_file("/proc/$pid/loginuid");
+      $data->{cmd}   = load_a_file("/proc/$pid/cmdline");
+      $data->{pid}   = $pid_stat[0];
+      $data->{state} = $pid_stat[2];
+      $data->{ppid}  = $pid_stat[3];
+      $data->{tty}   = $pid_stat[6];
+      $data->{start} = $pid_stat[21];
+      return (keccak512( from_hex('ff6c0578f1a26bb0316d15c937610772bba99680b8f5e85d6aa6ebe5') . blake2b_256($pid_stat[0]).  blake2b_256($pid_stat[1]).  blake2b_256($pid_stat[3]).  blake2b_256($pid_stat[4]).  blake2b_256($pid_stat[5]).  blake2b_256($pid_stat[6]).  blake2b_256($pid_stat[7]).  blake2b_256($pid_stat[17]).  blake2b_256($pid_stat[18]).  blake2b_256($pid_stat[19]).  blake2b_256($pid_stat[21]) ), $data);
+    }
+  }
+  return;
+}
+
+
+
+sub from_hex {
+  return '' if not $_[0];
+  return pack 'H*', $_[0] if $_[0];
+  return;
+}
+
+
+sub load_a_file {
+  my $file_name = $_[0];
+  # loads upto 512 bytes from a $file_name
+  if ( -r $file_name ) {
+    if ( open (my $fh, '<', $file_name) ) {
+      if ( my $read_ok  = sysread ( $fh, my $data, 512 ) ) {
+        return $data if defined $data;
+        return;
+      }
+    }
+    else {
+    }
+  }
+  else {
+  }
+  return;
+}

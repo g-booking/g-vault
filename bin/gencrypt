@@ -1,0 +1,61 @@
+#!/usr/local/_gvault/bin/perl
+use v5.20;
+use strict;
+use warnings;
+use Scalar::Util qw( looks_like_number );
+
+require "/usr/local/_gvault/lib/gVault.pm";
+
+## No buffering...??? probably for the best, dunno really.
+$| = 1;
+
+my $vault_name;
+$vault_name = $ENV{_gvde_} if  $ENV{_gvde_};
+$vault_name = $ARGV[0]     if  $ARGV[0];
+die "Usage $0 <name_of_vault__or__vault_location>\n" if not $vault_name;
+
+gVault::gvault ( $vault_name ) or die "I could not load the master vault for that.\n";
+$vault_name = gVault::get_vault_name($vault_name);
+
+### so here is so so simple... we read a file in chunks.... and we encrypt each...with gvault.
+### I read about IOSELECT but dunno... not using it here... but maybe this can do something for me... for now, this is just mr. simple and that works.
+
+my ( $total_bytes, $encry_bytes, $chunks, $read ) = 0;
+my $next_s      = '';
+my $tty         = 1;
+my $fh          = *STDIN;
+my $buffer_size = 10 * 1024 * 1000;
+
+if ( $ARGV[1] and looks_like_number($ARGV[1]) and $ARGV[1] > 1 ) {
+  $buffer_size = $ARGV[1];
+  $buffer_size = 4200000000 if $buffer_size > 4200000000;
+  print STDERR "Set a custom input buffer size of [$buffer_size].\n";
+}
+
+undef $tty if ( -t *STDOUT ); ## tty, just output it
+
+## How simple is this... :)  love that.
+do {
+    $read   = read $fh, (my $buf), $buffer_size;
+    encrypt(\$buf) if $read;
+} while ($read);
+
+print STDERR "\n" if not $tty;
+print STDERR "Encrypted [$total_bytes] bytes in [$chunks] chunk with an overhead of [" . ($encry_bytes - $total_bytes) . "] bytes.\n"  if $chunks == 1; 
+print STDERR "Encrypted [$total_bytes] bytes in [$chunks] chunks with an overhead of [" . ($encry_bytes - $total_bytes) . "] bytes.\n" if $chunks != 1; 
+
+sub encrypt  {
+  my $data = ${$_[0]};
+  $chunks++;
+  $total_bytes += length($data);
+  ($next_s, $data) = gVault::gencrypt( $vault_name, $data, $next_s ) or die "I need a doctor.\n"; # use same var? saves memory?
+  $encry_bytes += 4 + length($data);                                                      # 4 byte length header
+  my $length_h  = join( '', split '', pack 'H*', sprintf( '%08x', length($data) ) );      # re-look at when you are sober.
+  print STDOUT        $length_h . $data   if     $tty;
+  print STDOUT to_hex($length_h . $data)  if not $tty;
+}
+
+sub to_hex {
+  return unpack("H*",  $_[0]) if $_[0];
+}
+

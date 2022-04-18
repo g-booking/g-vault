@@ -1,0 +1,89 @@
+#!/usr/local/_gvault/bin/perl
+use strict;
+use warnings;
+use feature  qw(signatures);
+no  warnings qw(experimental::signatures);
+use HTTP::Tiny;
+use JSON::XS;
+use Data::Dump qw (dump);
+# Super simple Telegram script that sends to a user via a Telegram BOT.
+
+my $http = HTTP::Tiny->new();
+my $cmd  = check_args();
+
+get_updates(); exit;
+$cmd->{text} = generate_message($cmd->{text});
+my $resp     = $http->post_form("https://api.telegram.org/bot$ENV{_gv_BOT_TOKEN}/sendMessage", $cmd);
+
+_FAIL ("Send message to telegram user [$cmd->{chat_id}] failed.") if not $resp;
+_FAIL ("Send message to telegram user [$cmd->{chat_id}] failed. [$resp->{reason}]") if not $resp->{status} or $resp->{status} != 200;
+_INFO ("SUCCESS.");
+
+
+
+
+sub generate_message ($text) {
+  use Sys::Hostname;
+  use Socket;
+  my ( $hostname, $ip );
+  $hostname = hostname;
+  $ip = inet_ntoa(scalar(gethostbyname($hostname))) if $hostname;
+  my $uptime = `/usr/bin/uptime`; chomp $uptime;
+  $hostname = $hostname || 'unknown';
+  $ip       = $ip       || 'unknown';
+  $uptime   = $uptime   || 'unknown';
+
+  my $message = "
+  [$text].
+  The server [$hostname] @ [$ip] requires external authorisation to continue.
+  [$uptime].
+
+Please take the appropriate action.\n";
+
+  return $message;
+}
+
+sub check_args {
+  my $cmd  = command_line(@ARGV);
+  if ( (not $cmd) or ( not $cmd->{chat_id} or not $cmd->{text} ) or (not $ENV{'_gv_BOT_TOKEN'})  ) {
+    _FAIL ("  $0    \\\n       -chat_id  <telegram_id>\n       -text     <message_to_send>") if (not $cmd) or ( not $cmd->{chat_id} or not $cmd->{text} );
+    _FAIL ("  $0 needs your Telegram BOT API token in the '_gv_BOT_TOKEN' ENV variable.")    if  not $ENV{'_gv_BOT_TOKEN'};
+  }
+  return $cmd;
+}
+
+sub get_updates {
+
+  undef $cmd;
+  $cmd->{offset} = 1;
+  $resp= $http->post_form("https://api.telegram.org/bot$ENV{_gv_BOT_TOKEN}/getUpdates", $cmd);
+  
+  if ( $resp and  $resp->{status} == 200 ) {
+    my $c = decode_json($resp->{content});
+    _INFO ( dump $resp );
+    _INFO ( dump $c );
+  }
+
+}
+
+
+########################## below here is boring standard stuff I use ######################
+
+sub _FAIL ($message) {
+  _ERROR ($message);
+  exit 1;
+}
+
+sub command_line (@args) {
+  my $commands; for (my $f=0; $f<@args; $f++) { if ( $args[$f]=~m/^\-(.*)$/ ) { my $cmd = $1; if (  $args[$f+1] ) { if ( $args[$f+1]=~m/^\-(.*)$/ ) { $commands->{$cmd} = ''; } else { $commands->{$cmd} = $args[$f+1]; $f++; } } else { $commands->{$cmd} = ''; } } } return $commands;
+}
+
+sub _ERROR ($message) {
+  return if not $message; chomp $message; print STDERR $message . "\n"; return;
+}
+
+sub _INFO ($message) {
+  return if not $message; chomp $message; print $message . "\n";
+}
+
+##########################################################################################

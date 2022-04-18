@@ -1,0 +1,1109 @@
+#!/usr/local/_gvault/bin/perl
+use v5.20;
+use warnings;
+use feature  qw(signatures);
+no  warnings qw(experimental::signatures);
+use IO::Socket::UNIX;
+use Crypt::Mode::CBC;
+use Scalar::Util               qw( looks_like_number );
+use Crypt::Digest::BLAKE2b_256 qw( blake2b_256 blake2b_256_file );
+use Crypt::PRNG                qw( rand random_bytes );
+use Crypt::Checksum::CRC32     qw( crc32_data_hex    );
+use Crypt::Digest::Keccak512   qw( keccak512 );
+use Storable                   qw( freeze thaw       );
+use Data::Dump                 qw( dump              );
+use MIME::Base64               qw( decode_base64 encode_base64     );
+use File::Basename;
+ 
+use Cwd qw (abs_path realpath);
+require "/usr/local/_gvault/lib/gVault.pm";
+use constant VERSION => '0.90';
+my $secret_file   = '';
+my $secret_suffix = 'gvault';
+my $SOCK_PATH     = "/usr/local/_gvault/sock/.gvault.sock";
+
+$| = 1; ## No buffering...
+
+# This script is a bit fucked up and needs a tidy.... it has evolved, it works just fine... but for now, it will stay as it is.
+
+my $cmds = command_line(@ARGV);
+my $gload;
+my $auth_file  = '';
+my $auth_name  = '';
+my $gv = '';
+my $g_two     = Crypt::Mode::CBC->new('TwoFish', 1, 16);
+my $GVID      = $ENV{_gvid_} || '';
+if (not defined $cmds) {
+  print STDERR " $0 v" . VERSION . "\n";
+  print STDERR "    -c  <gVault_name>                    Creates a gVault\n";
+  print STDERR "    -ch <gVault_name>                    Creates a gVault and initalises it in your HOME dir.\n";
+  print STDERR "    -v  <gVault_name or full_file_path>  Loads a gVault\n";
+  print STDERR "    -d  <destination_directory>          Specifies a creation destination (use with -c)\n";
+  print STDERR "    -s                                   Requests a session password for gVault\n\n";
+
+  print STDERR "    -ap  <PID or process_name>           Authorises a RUNNING PID to utilise your credentials\n";
+  print STDERR "    -ae  <full_file_path>                Authorises an EXECUTABLE to utilise your credentials\n";
+  print STDERR "    -au  <user_id>                       Authorises the UID of the user to be authenticated.\n";
+  print STDERR "    -aa  <give_your_arg_for_exe>         Authorises an additional ARGUMENT used when calling EXE.\n\n";
+
+
+  print STDERR "    -pp <1-64> (prefix with x for no cr) Shows a 32 char PRINTABLE password between 1-64. -pp 21 -pp x64\n";
+  print STDERR "    -pw <write_this_file>                Write and DELETE the above secret file, 100ms. Use -ps x to inc.\n";
+  print STDERR "    -pr <reference_file_for_permissions> Set the permissions to the same as this file when writing secret.\n";
+  exit;
+}
+
+my $pepper_conf;
+
+my $env = trap_env();
+make_c      ($cmds->{c})  if ( $cmds->{c}  );  # create a gVault
+make_c      ($cmds->{ch})  if ( $cmds->{ch}  );  # create a gVault
+load_gvault ($cmds->{v})  if ( $cmds->{v}  );  # load a gVault
+
+$auth_name = auth_process_NAME ($cmds->{aa})              if ( $cmds->{aa} );
+$auth_file = auth_process_FILE ($cmds->{ae}, $cmds->{ap}) if ( $cmds->{ae} and $cmds->{ap}  );  # auth a gVault
+$auth_file = auth_process_FILE ($cmds->{ae}, '')          if ( $cmds->{ae} and not $cmds->{ap}  );  # auth a gVault
+
+auth_process_PID  ($cmds->{ap}, $auth_file, $auth_name)   if ( $cmds->{ap}  );  # auth a gVault
+
+my $ref_file   = $cmds->{pr}  if ( $cmds->{pr}  ); 
+my $write_file = get_write_file($cmds->{pw})  if ( $cmds->{pw}  ); 
+
+show_passwd('p', $cmds->{pp})  if ( $cmds->{pp}  );  # show a gVault password.
+get_session('s', $cmds->{s})  if ( defined $cmds->{s}  );    # gets a session password.
+
+sub auth_process_NAME ($name) {
+  return $name;
+}
+
+sub get_session {
+  if ( $cmds->{v} ) {
+    _ERROR ("You cannot load a gVault AND request a (-s) session secret. This is because the ENV is cleared within gVault so once the vault has been loaded then the information is not available for the session secret to utilise so it would therefore fail. A session secret is for this session only and also is not therefore linked to a gVault.");
+    exit 1;
+  }
+  ## so we ask for a session password... I was gonna link this to _gvid_ but actually we'll track the PIDS and really there is no need... so you CAN LOAD A gVAULT and use this now... but anyway.
+  my $id = blake2b_256 ( from_hex('d2cf868880618395e6f86a829377b5a9ad17a900') .  keccak512 ("$GVID " . from_hex('fd531b53e20ed82e7475fde7')) );
+  my $ok = socket_send("SESSION pid=$cmds->{s} data=" . to_hex($id));
+  if ( not $ok ) {
+    #_ERROR("gVault did not return a session password. Probably it's already been set for this session? Does the PID exist? You may only request a session secret ONCE per session.");
+    exit 1;
+  }
+  print $ok . "\n" if $ok;
+}
+
+sub get_write_file ($file_name) {
+
+  if ( not realpath($file_name) ) {
+    _ERROR("The filename [$file_name] can't be accessed or has some permission issues or something.");
+    exit 1;
+  }
+
+  $file_name = realpath($file_name);
+  
+  if ( -e $file_name ) {
+    _ERROR("The filename [$file_name] cannot exist with auto-delete, please ensure it is never present.");
+    exit 1;
+  }
+  if ( not check_write($file_name) ) {
+    _ERROR("The filename [$file_name] cannot be written so I cannot do that.");
+    exit 1;
+  } 
+  return $file_name;
+}
+
+
+
+sub auth_process_FILE ( $file_name, $pid ) {
+  if (not -r $file_name ) {
+    _ERROR("I cannot read the [$file_name] so I am unable to authorise this request, please use an elevated account if required.");
+    exit 1;
+  }
+  $file_name = realpath($file_name);
+  return $file_name if $pid ne '';
+
+
+  _ERROR("If you wish to give GLOBAL access to [$file_name] then please add the argument =>   -p 1     which will match everything always.");
+  exit 1;
+
+
+}
+
+sub auth_process_PID ( $pid, $exe, $name ) {
+  $gload =  $ENV{_gvde_} if not $gload and  $ENV{_gvde_};
+  if ( not $gload ) {
+    _ERROR ("-ap requires a gVault to be loaded using -v <gVault_name> as each request authorises a single vault.\n");
+    exit 1;
+  }
+  my $suid;
+  if ( defined $cmds->{au} ) {
+    if ( looks_like_number($cmds->{au})  ) {
+      $suid = int( $cmds->{au} );
+    }
+    else {
+      _ERROR("-au <UID> must resemble a number.");
+      exit 1;
+    }
+  }
+  if ( not looks_like_number($pid) ) {
+    $pid = find_pid($pid);
+    if ( not looks_like_number($pid) ) {
+      _ERROR("-ap <pid> must resemble an existing running process.");
+      exit 1;
+    }
+  } 
+  gVault::gvault($gload) or return _ERROR("Default gVault [$gload] failed to load.");
+ 
+  $pid = int($pid);
+  if ( looks_like_number($pid) and not -e "/proc/$pid" ) {
+   _ERROR ("The PID [$pid] is not running.");
+   exit 1;
+  }
+  if ( not $exe ) {
+    _ERROR ("You must specify an executable -ae </full/path/to.exe> with an optional -an <custom> as well as a -ap <pid>") if not $exe;
+    exit 1;
+  }
+  my $pid_data = get_pid_data($pid) or return _ERROR ("Could not get the PID data.");
+  my $file_sha = to_hex(blake2b_256_file($exe)) or return _ERROR("Could not SHA the file.") if $exe;
+  $suid = "*" if not defined $suid;
+  _ERROR ("Authorising gVault [$gload] for the running process PID [$pid], UID [$suid] for the executable [$exe $name].") if $exe;
+  my ($gname, $gvault) = gVault::get_gg ($gload);
+  my $master_secret    = $env->{gVault::env($gname)};
+  return _ERROR ("Can't get the master for that one... this should not happen.") if not $master_secret;
+  my $auth;
+  $auth->{name}      = $name;
+  $auth->{suid}      = $suid;
+  $auth->{pid}       = $pid;
+  $auth->{ppid}      = $pid_data->{ppid};
+  $auth->{pid_start} = $pid_data->{start};
+  $auth->{exe_path}  = $exe;
+  $auth->{exe_hash}  = $file_sha || '';
+  $auth->{gv_name}   = $gname;
+  $auth->{gv_load}   = $gvault;
+  $auth->{env}       = gVault::env($gname) || 'blank_2';
+  $auth->{gv_etc}    = gVault::get_etc_location($gvault); 
+  $auth->{_gv_id_}   = $ENV{_gvid_};
+  $auth->{_gv_}      = $gv;
+  $auth->{master}    = session_dec($master_secret);
+  my $auth_freeze = freeze ($auth);
+  undef $auth;
+  #
+  # So we freeze this.... encrypt it with gVault using the loaded vault... HEX it up... and then pass the HASH to gVault daemon whom will give us a special key!
+  # This key is unique, it is authenticated encryption with the gVault and the gDaemon uses the hash as part of our key in addition to some other shit i haven't
+  # wrote yet.... so basically you can't, impossible to replicate this... OK! let's do it!
+  ## ok, let's send off to gVault daemon...
+  my $id = socket_send ( "CMD data=" . to_hex($auth_freeze) );
+  die "Something went wrong, does the socket exist?\n" if not $id;
+  print STDOUT ("$id\n") if $id;
+}
+
+
+
+
+
+sub show_passwd ($type, $x) {
+  my $cr = "\n";
+  if ( $x and substr($x,0,1) eq 'x' ) {
+    $x = substr($x,1);
+    $cr = '';
+  } 
+  if ( not looks_like_number($x) ) {
+    _ERROR ("-p requires an integer between 1 and 64 inclusive please.\n");
+    exit 1;
+  }
+  if ( $x<1 or $x>64 ) {
+    _ERROR ("-p requires an integer between 1 and 64 inclusive please.\n");
+    exit 1;
+  }
+  $gload =  $ENV{_gvde_} if not $gload and  $ENV{_gvde_};
+  if ( not $gload ) {
+    _ERROR ("-p requires a gVault to be loaded using -v <gVault_name> to show a password from that gVault.\n");
+    exit 1;
+  }
+  gVault::gvault($gload) or return _ERROR("Default gVault [$gload] failed to load.");
+  my $r = $x;
+  $x += 255;
+  my $o = gVault::from_hex(gVault::gpassword(gVault::get_vault_name($gload), $x));
+  my $data = $o;
+  if ( -t *STDIN ) {
+    ## tty, just output it
+  }
+  else {
+    $data = '';
+    while (<STDIN>) {
+      $data .= $_;
+    } 
+    if ( $data =~/^(.*?)_gvault_secret_hex_(.*?)_gvault_secret_hex_(.*?)$/gs ) {
+      my $de_hex = gVault::decrypt(gVault::get_vault_name($gload), substr(from_hex($2), 4) );
+      chomp $de_hex;
+      $data = "$1$de_hex$3";
+    }
+    $data=~s/_gvault_secret_x_/$o/mg;
+    $data=~s/_gvault_secret_$r\_/$o/mg;
+  }
+  if ( defined $write_file ) {
+    return if -e $write_file;
+    my $path_name = dirname(realpath($write_file));
+    return _ERROR ("Sorry, cannot find real path from [$write_file].") if not $path_name or not -d $path_name;
+    my $rm_sh_file = "$path_name/.gVault" . $$ . "_rm_script_" . $$ . "_rm.sh";
+    my $sleep = 0.15;
+    if ( $cmds->{ps} and looks_like_number($cmds->{ps}) ) {
+      $sleep = $cmds->{ps};
+      _ERROR ("WARNING: Sleep override from from 0.1s to $sleep" . "s.");
+    }
+    open my $out,    '>', "$write_file" or return _ERROR("Could not open for writing [$write_file].");
+    close $out;
+    open my $out_rm, '>', $rm_sh_file or return _ERROR("Could not open for writing [$rm_sh_file].");
+    close $out_rm;
+    chmod 0600, $rm_sh_file or return _ERROR ("5. Could not open for chmod [$rm_sh_file].");
+    open $out_rm, '>>', $rm_sh_file or return _ERROR("Could not open for writing [$rm_sh_file].");
+    my $rm = ''; 
+    $rm = "
+    /usr/bin/srm -E -f $write_file
+    /usr/bin/srm -f $write_file
+    " if -r '/usr/bin/srm';
+    _ERROR ("WARNING: gVault recommends installation of secure deletion tool 'srm' which improves security.") if $rm eq '';
+    print $out_rm "#!/bin/sh
+    sleep $sleep;
+    $rm
+    /usr/bin/rm -f $write_file
+    /usr/bin/rm -f $rm_sh_file
+
+    "; 
+    close $out_rm;
+    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size, $atime,$mtime,$ctime,$blksize,$blocks) = stat($ref_file) if $ref_file and -r $ref_file;
+    chmod 0500, $rm_sh_file or return _ERROR ("6. Could not open for chmod [$rm_sh_file].");
+    my $at = 1;
+    $at = system("/usr/bin/systemctl is-active --quiet atd") if -r '/usr/bin/systemctl';
+    _ERROR ("WARNING: gVault recommends installation of job scheduling tool 'at' or 'atd' which improves security.") if $at != 0 and -r '/usr/bin/systemctl';
+    my $ok = system("/usr/bin/env -i cat $rm_sh_file | /usr/bin/env -i /usr/bin/at -M now >/dev/null 2>/dev/null") if -r '/usr/bin/at' and $at == 0;
+    if ( chmod 0600, "$write_file" ) {
+      ## File created, just us can write...
+      if ( open $out, '>>', "$write_file" ) {
+        ## We can append
+        my $ok = system("/usr/bin/nohup $rm_sh_file  >/dev/null 2>/dev/null &"); 
+        return _ERROR ("Could not execute remove script. [$ok]") if not defined $ok or $ok != 0;
+        if ( print $out  $data ) {
+          # We wrote something
+          close $out;
+          if ( chmod 0400, "$write_file" ) {
+            # Only read us! OK!
+            if ( $ref_file and -r $ref_file and $ino ) {
+              chmod 0600, "$write_file" or   return _ERROR ("Could not chmod 600 for [$write_file].");
+              chown $uid, $gid, $write_file or  _ERROR ("I could not set the owner/guid as per the reference file for [$write_file].");
+              chmod $mode, $write_file  or   return _ERROR ("I Could not open for chmod [$write_file].");;
+            }
+            return 1;
+          }
+        }
+      }
+    }
+    # Could not chmod or more.... we need to delete it...
+    unlink $write_file;
+  }
+  else {
+    print STDOUT "$data$cr" if $data;
+  }
+  return;
+}
+
+
+
+sub load_gvault {
+  my $keys = scalar ( keys %{$cmds} );
+  $gv = $ENV{_gv_} if $ENV{_gv_};
+  if ( gVault::gvault ($cmds->{v}) ) {
+    my $display = $cmds->{v};
+    $display=~s/^\.(.*?)\.gvault$/$1/;
+    $display=~s/^\/.*?\/\.(.*?)\.gvault$/$1/;
+    _ERROR ("gVault [$display] loaded successfully.") if $keys == 1;
+    $gload = $cmds->{v};
+    return 1;
+  }
+  else {
+    _ERROR ("gVault [$cmds->{v}] failed to load..\n") if $keys == 1;
+    exit 1;
+  }
+}
+
+
+
+sub make_c ($v) {
+  my $dir_to_use = $ENV{HOME};
+  $dir_to_use    = $cmds->{d} if $cmds->{d};
+  $secret_file = "$dir_to_use/.$v.$secret_suffix";
+  die "Usage: $0 <name_of_gvault>\n" if not $v;
+  die "The ENV{'HOME'} variable needs to be set to a directory for me to run correctly.\n" if not $ENV{"HOME"};
+  die "The ENV{'HOME'} directory needs to exist for me to run correctly.\n"                if not -d $ENV{"HOME"};
+  die "Please pass the <gvault> without the leading '.' on the filename.\n"                if     $v=~m/^\./;
+  die "Please pass the <gvault> without specifying a directory on the filename.\n"         if     $v=~m/^\//;
+  die "Please pass the <gvault> without the suffix '.$secret_suffix' on the filename.\n"   if     $v=~m/\.$secret_suffix$/;
+  die "Can't make the gVault [$v], [$secret_file] already exists, please remove it if you wish to change it.\n"             if  -e $secret_file;
+  die "I am unable to write to the <gvault>, please check permissions.\n"                  if not check_write($secret_file);
+  make_g_vault($v, $secret_file);
+}
+
+sub command_line (@args) {
+  my $commands;
+  for (my $f=0; $f<@args; $f++) {
+    if ( $args[$f]=~m/^\-(.*)$/ ) {
+      my $cmd = $1;
+      if ( defined $args[$f+1] ) {
+        if ( $args[$f+1]=~m/^\-(.*)$/ ) {
+          $commands->{$cmd} = ''   if not defined $cmd;
+          $commands->{$cmd} = $cmd if defined $cmd;
+        }
+        else {
+          $commands->{$cmd} = $args[$f+1];
+          $f++;
+        }
+      }
+      else {
+        $commands->{$cmd} = '';
+      }
+    }
+  }
+  return $commands;
+}
+
+
+sub make_g_vault ($secret_name, $secret_file) {
+
+  # first check we have gvault ID for this user in export available
+  if ( not $ENV{_gvid_} ) {
+    my $gvid = "ff" . to_hex(make_password(31));
+    _ERROR ('
+
+');
+    _ERROR('
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+' . decode_base64('ICAgICAgICAgICAgICBfXyAgICAgIF9fICAgICAgICAgICAgXyAgXyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgXCBcICAgIC8gLyAgICAgICAgICAgfCB8fCB8ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICBfXyBfICBfX19fX19cIFwgIC8gL19fIF8gIF8gICBfIHwgfHwgfF8gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAvIF9gIHx8X19fX19ffFwgXC8gLy8gX2AgfHwgfCB8IHx8IHx8IF9ffCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiB8IChffCB8ICBfX19fXyAgXCAgL3wgKF98IHx8IHxffCB8fCB8fCB8XyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogIFxfXywgfCAvIF9fX198ICBcLyAgXF9fLF98IFxfXyxffHxffCBcX198ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgX18vIHx8IChfX18gICAgX19fICAgX19fICBfICAgXyAgXyBfXyAgX19fICAgXyAgIF8gICBfX18gICBfICAgXyAgXyBfXyAgCiAgfF9fXy8gIFxfX18gXCAgLyBfIFwgLyBfX3x8IHwgfCB8fCAnX198LyBfIFwgfCB8IHwgfCAvIF8gXCB8IHwgfCB8fCAnX198IAogICAgICAgICBfX19fKSB8fCAgX18vfCAoX18gfCB8X3wgfHwgfCAgfCAgX18vIHwgfF98IHx8IChfKSB8fCB8X3wgfHwgfCAgICAKICAgICAgICB8X19fX18vICBcX19ffCBcX19ffCBcX18sX3x8X3wgICBcX19ffCAgXF9fLCB8IFxfX18vICBcX18sX3x8X3wgICAgCiAgICAgICAgICAgICAgICAgICAgIF8gICAgICAgICAgICAgICAgICAgICAgICAgICBfXy8gfCAgICAgICAgICAgICBfICAgICAgIAogICAgICAgICAgICAgICAgICAgIChfKSAgICAgICAgICAgICAgICAgICAgICAgICB8X19fLyAgICAgICAgICAgICB8IHwgICAgICAKICAgX19fICBfIF9fIF9fICAgX18gXyAgXyBfXyAgX19fICAgXyBfXyAgIF8gX18gX19fICAgIF9fXyAgXyBfXyAgfCB8XyAgICAgCiAgLyBfIFx8ICdfIFxcIFwgLyAvfCB8fCAnX198LyBfIFwgfCAnXyBcIHwgJ18gYCBfIFwgIC8gXyBcfCAnXyBcIHwgX198ICAgIAogfCAgX18vfCB8IHwgfFwgViAvIHwgfHwgfCAgfCAoXykgfHwgfCB8IHx8IHwgfCB8IHwgfHwgIF9fL3wgfCB8IHx8IHxfICAgICAKICBcX19ffHxffCB8X3wgXF8vICB8X3x8X3wgICBcX19fLyB8X3wgfF98fF98IHxffCB8X3wgXF9fX3x8X3wgfF98IFxfX3wgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo=') );
+  _INFO ('
+###### gVault ~/.bashrc START ########
+ export _gvid_=' . $gvid . '
+ export _gvss_=`/usr/local/bin/gvault -s`
+ GVSH=`/usr/local/_gvault/sys/cat ~/.gv.sh | /usr/local/_gvault/sys/sha512sum`
+ export   _gv_=`~/.gv.sh $$ 1 $GVSH`   # PARANOID MODE
+ #export   _gv_=`~/.gv.sh $$`          # NOT IN PARANOID MODE
+
+ # gVault, check if authorisation succeded or not... if using gVault daemon that is...
+ if [ -z "$_gv_" ]
+   then
+      echo "gVault FAILED authentication."
+   else
+      echo "gVault is authenticated."
+ fi
+
+ # master secrets here #
+
+
+
+ # and we check here #
+ for gvault in `ls ~/.*.gvault 2>/dev/null`
+ do
+   if [ -f "$gvault" ]; then
+     gvault -v "$gvault"
+   fi
+ done
+
+###### gVault ~/.bashrc FINISH ########
+
+');
+
+    _ERROR ("\nWelcome to gVault.\n");
+     my $gvsh = "$ENV{HOME}/.gv.sh";
+    if ( not -f $gvsh and write_secret_file ( $gvsh, writeout_gv_sh() ) ) {
+      _ERROR ("gVault has created a user editable authentication script [$gvsh].");
+      chmod 0700, $gvsh;
+    } 
+    _ERROR ("Please add the ABOVE to your ~/.bashrc start-up file. (or if you are not using BASH, please add to the appropriate file).");
+    _ERROR ("OR, run, to add it non-interacively without displaying it:\n =>    $0 $ARGV[0] $ARGV[1] 2>/dev/null >>" . $ENV{"HOME"} . "/.bashrc ");
+    _ERROR (" \nOnce '\$gv_id' is available to any shell, please re-run:\n =>    $0 $ARGV[0] $ARGV[1]");
+    die "\n";
+  }
+  $pepper_conf = blake2b_256(gVault::load_a_file(make_the_pepper()));
+  $pepper_conf = blake2b_256(gVault::load_a_file(make_the_pepper())) if $pepper_conf eq '0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8';
+  die "Man, we got something messed all around in the /etc pepper stuff man... this really shouldn't happen so I dunno right now... try a reset a bit.\n" if not $pepper_conf;
+
+  my $basic_lock_file = "$ENV{HOME}/___this_is_a_g_crypt_temp_file_to_prevent_parallel_secret_adding.delete_me.woofwoofwoof.tmp";
+  if ( -e $basic_lock_file ) {
+    die "Sorry, DO NOT RUN PARALLEL secret adding... this is not APACHE inc!  Or if you're not and you're sure then delete [$basic_lock_file] but really this should be impossible to happen unless you server suffered a fuck off crash or maybe I didn't allow for something... ok!\n";
+  }
+  open(my $fh, '>', $basic_lock_file) or die "wtf no write? [$basic_lock_file]. \n"; 
+  close $fh;
+  if ( not check_env_master_or_die ($secret_name, $basic_lock_file, $secret_file) ) {
+    unlink $basic_lock_file;
+    die "Could not decrypt the MASTER password with the PEPPER, changed it?\n";
+  }
+  my $actual_secrets = make_secrets();
+  _ERROR ("All done, the vault [$secret_name] is saved at [$secret_file] and ready for use.\n") if ( save_secrets ($secret_name, $secret_file, $actual_secrets) );
+  unlink $basic_lock_file or die "wtf no delete? [$basic_lock_file]. (everything else worked in theory).\n";
+}
+
+sub to_hex {
+  return gVault::to_hex($_[0]);
+}
+
+sub make_the_pepper {
+  ## this is duplicated in gVault somewhere so if you change here then you need to change there probably
+  
+  my $full_path;
+  $full_path = '/etc/gVault.conf';              return $full_path if -r $full_path and not $cmds->{ch};
+  $full_path = $ENV{HOME} . '/etc/gVault.conf'; return $full_path if -r $full_path;
+
+  ### so there is no configuration file in /etc/  or   ~/etc/
+  # if we can write to /etc/ then we put the file there otherwise we use the home directory....
+  $full_path = '/etc/gVault.conf';
+  if (    check_write ( '/etc/gVault.conf' ) ) {
+    $full_path = '/etc/gVault.conf';
+  }
+  elsif ( check_write ( $ENV{HOME} . '/etc/gVault.conf' ) ) {
+    $full_path = $ENV{HOME} . '/etc/gVault.conf';
+  }
+  else {
+    die "I cannot find a PEPPER CONFIG file and I cannot write one either in [/etc] or [$ENV{HOME}/etc].\n";
+  }
+
+  ################ this is PERL script written to a file and not code below so don't be fooled... sorry!
+  ### Write some perl code to a variable and then SAVE it on the disk....
+  ################ this is PERL script written to a file and not code below so don't be fooled... sorry!
+
+
+  ## now use JSON.
+  my $json_pepper;
+  $json_pepper->{version}       =  VERSION;
+  $json_pepper->{1}  =  ( make_password (48) );
+  $json_pepper->{2}  =  ( make_password (48) );
+  $json_pepper->{3}  =  ( make_password (48) );
+  $json_pepper->{4}  =  ( make_password (48) );
+  $json_pepper->{5}  =  ( make_password (48) );
+  $json_pepper->{6}  =  ( make_password (48) );
+  $json_pepper->{7}  =  ( make_password (48) );
+  $json_pepper->{8}  =  ( make_password (48) );
+  $json_pepper->{9}  =  ( make_password (48) );
+  $json_pepper->{10}  = ( make_password (48) );
+  $json_pepper->{11}  = ( make_password (48) );
+  $json_pepper->{12}  = ( make_password (48) );
+  $json_pepper->{13}  = ( make_password (48) );
+  $json_pepper->{14}  = ( make_password (48) );
+  $json_pepper->{15}  = ( make_password (48) );
+  $json_pepper->{16}  = ( make_password (16) );
+  $json_pepper->{17}  = ( make_password (48) );
+  $json_pepper->{18}  = ( make_password (48) );
+  $json_pepper->{19}  = ( make_password (48) );
+  $json_pepper->{20}  = ( make_password (48) );
+  $json_pepper->{21}  = ( make_password (48) );
+  $json_pepper->{22}  = ( make_password (48) );
+  $json_pepper->{23}  = ( make_password (48) );
+  $json_pepper->{24}  = ( make_password (48) );
+  $json_pepper->{25}  = ( make_password (48) );
+  $json_pepper->{26}  = ( make_password (48) );
+  $json_pepper->{27}  = ( make_password (48) );
+  $json_pepper->{28}  = ( make_password (48) );
+  $json_pepper->{29}  = ( make_password (48) );
+  $json_pepper->{30}  = ( make_password (48) );
+  $json_pepper->{31}  = ( make_password (48) );
+  $json_pepper->{32}  = ( make_password (32) );
+
+  ## used to save this as a json but now i encrypt it as well, why not...  gives us a fixed length and this file is not designed to be editable...
+  ## but you can hack it apart easy peasy... just load it in, decrypt it with secrets below and thaw... and voila.... but apart from that dont worry.
+  ## Actually, changed that now... now you create the user_id first and we encrypt with this.... and we add a HMAC to this as it's an external file
+  ## and not an internal API.  Most internal API encryption does not feature a HMAC for speed however anything external anything anything anything
+  ## must have a HMAC... so we change here and now:
+
+  ## OK, donkey, let's use your new super config system.... first... we FREEZE.... internally.
+  my $frozen_pepper = freeze($json_pepper);
+  my $frozen_secret = keccak512 ( from_hex('1563a4f6a701') . blake2b_256($ENV{_gvid_} . '*') . blake2b_256(from_hex('6c6c') . $full_path) ) if $ENV{_gvid_};
+  if ( not $frozen_secret ) {
+    unlink $full_path;
+    die "I could not make a secret, check your ENV{'_gvid_'} is available?\n";
+  }
+  my $x;
+  $x->{s} = gVault::session_enc( substr($frozen_secret,  0, 32) );
+  $x->{v} = gVault::session_enc( substr($frozen_secret, 32, 16) );
+  $x->{h} = gVault::session_enc( substr($frozen_secret, 48, 16) );
+
+  if ( write_secret_file ( $full_path,  gVault::enc_two(1, $x, $frozen_pepper) ) ) {
+    _ERROR ("gVault has created a new collection of secure cryptographic PEPPER secrets in [$full_path].");
+    return  $full_path;
+  }
+  else {
+    unlink $full_path;
+    die "I FAILED to write a new pepper file to [$full_path]. This is kinda serious and we're full stop man.\n";
+  }
+  die "Please now RE-RUN the script with the same arguments as the PEPPER file is now ACTIVE.\n"; 
+}
+
+
+sub check_env_master_or_die ($secret_name, $basic_lock_file, $secret_file) {
+  # load the pepper config if we have it... this is a bit fucked up to be honest in the code.
+  # I know it works correctly but it's evolved a bit and I haven't done the evolve tidy as yet.
+  # basically, we loaded the etc/gVault.conf here and we load other places as well so that can't be right overall but hey and woof 
+  my $etc_name = gVault::get_etc_location($secret_file);
+  return _ERROR ("I cannot find the gVault.conf for this vault.") if  not $etc_name;
+  gVault::load_json_conf_into_config($etc_name);
+  my $load  = gVault::load_master(undef, $secret_name, $secret_file);
+  return 1 if $load;
+  my $file_name =  $ENV{"HOME"} . "/.bashrc";
+  check_permissions($basic_lock_file, $file_name);
+  ## We do not have a MASTER password in the ENV for this secret suite.
+  ## Let's create a new MASTER password for this one... The master is DOUBLE encrypted... with AES and RC6
+  ## We use AES and RC6 as they are statistally dissimilar. i.e. Block size, transformation functions, overall structure of the algo, feistel v substituion. 
+  ## Of course we use entirely different 32 byte binary secrets with 16 byte binary IV with 32 byte binary HMAC for both keys and the algo is quite different. 
+  ## So we get superior security even if this is completely ridiculous and unnecessary... which it totally is but woof woof there you go....!
+  ## This security suite tries to assume you have been hacked already........
+  my $master_secret = gVault::make_master_secret($secret_name, $pepper_conf);
+  if ( not $master_secret or not $master_secret->{s} or not $master_secret->{s2} or not $master_secret->{v} or not $master_secret->{v2} or not $master_secret->{h} or not $master_secret->{h2} ) {
+    _ERROR("We did not find what we were looking for." . dump $master_secret);
+    unlink $basic_lock_file;
+    die ("We need a pepper man... we do minimal checks so get it right... probably you have invalidated the pepper file [$etc_name] unknowningly.\n");
+  }
+  unlink $basic_lock_file or die "wtf no delete? [$basic_lock_file]. (everything else worked in theory).\n";
+
+  ## Ok.. better instructions needed....
+  _ERROR ("\nWelcome to the world gVault [$secret_name], let's make you a MASTER SECRET for your DNA.\nYou can find your master secret below, please add this to your shell start-up:");
+  _ERROR ("\nHISTCONTROL=ignorespace\n");
+  _INFO  (" #gVault [$secret_name]\n export " .  gVault::env($secret_name) . "=" .  gVault::to_hex( enc_aes_rc6   ( $master_secret, make_password (32+32+16+16+32+32+32+32)) ) );
+
+  my $base64  = "#!/bin/sh
+ export _gv_sed_search='# master secrets here #'
+ export _gv_sed_replace=\"#gVault [$secret_name]\\n export " . gVault::env($secret_name) . "=" .  gVault::to_hex( enc_aes_rc6   ( $master_secret, make_password (32+32+16+16+32+32+32+32)) ) . "\\n\\n# master secrets here #\"
+ sed -i \"s/\$_gv_sed_search/\$_gv_sed_replace/\" $ENV{HOME}/.bashrc";
+
+  _ERROR ("\n\n\nOR, please execute the below which will automatically add it:");
+  _ERROR ("     echo " .  encode_base64($base64,'') . " | base64 -d | sh");
+
+  #_ERROR ("
+#
+ #_gv_sed_search='# master secrets here #'
+#_gv_sed_replace=\$\"#gVault [$secret_name]\\n" . gVault::env($secret_name) . "=" .  gVault::to_hex( enc_aes_rc6   ( $master_secret, make_password (32+32+16+16+32+32+32+32)) ) . "\\n\\n# master secrets here #\"
+ #sed -i \"s/\$_gv_sed_search/\$_gv_sed_replace/\" $ENV{HOME}/.bashrc");
+#
+#
+#
+#
+
+
+  _ERROR ("\n Once the '\$_gv_xxxxx' is available to any shell then simply re-run:\n =>    $0 $ARGV[0] $ARGV[1]\n\n");
+   exit;
+}
+
+
+sub make_secrets {
+  ## 3 different algo's
+  ## each double encrypted
+  #  3 algos x 2 double encrypted x 256 secrets  = 1,536 seperate secrets
+  #   
+  _ERROR ("Creating a vault...");
+  my $tmp_secrets;
+  my $variation = 0;
+  for (my $variations=1; $variations<=64; $variations++) {   
+    for (my $algo=1; $algo<=4; $algo++) {
+      $tmp_secrets->{$variation}->{algo} = $algo;
+      $tmp_secrets->{$variation}->{s} = session_enc( make_password (32) );
+      $tmp_secrets->{$variation}->{v} = session_enc( make_password (16) );
+      $tmp_secrets->{$variation}->{h} = session_enc( make_password (32) );
+      $tmp_secrets->{$variation}->{k} = session_enc( make_password (32) );
+      $variation++; 
+    }
+  }
+ ## and we make some more passwords that can be used for various uses.... how many to make?  let's say 64...
+  for (my $variations=1; $variations<=64; $variations++) {   
+    while (not defined  $tmp_secrets->{$variation}->{s}) {
+      $tmp_secrets->{$variation}->{s} = session_enc( make_printable_secret()  );
+    }
+    $variation++; 
+  }
+  ## the above forms the main basis of the main passwords... however.. we can include a bit more information in this file
+  ## which may or may not come in useful later on.
+  ## We will take a HASH digest of the key files which were used to create these secrets so that if they change we can at least notice this. 
+  $tmp_secrets->{lib} = gVault::digest_file('/usr/local/_gvault/lib/gVault.pm');
+  $tmp_secrets->{bin} = gVault::digest_file('/usr/local/_gvault/bin/gvault');
+  $tmp_secrets->{sys} = gVault::digest_file('/usr/local/_gvault/sys/g_vaultd');
+  return $tmp_secrets;
+}
+
+sub make_password ($bytes) {
+  my $password = '';
+  my $iv = make_random_8_bit_number();
+  while (length($password) != $bytes) {
+    my $c;
+    $c = chr( make_random_8_bit_number() ) if  int(rand(256)) == $iv;
+    $password .= $c if $c and $c ne "'";
+  }
+  return $password;
+}
+
+sub make_random_8_bit_number {
+  return ord(random_bytes(1));
+}
+
+
+sub check_write ($secret_file) {
+  return 1 if -w $secret_file;
+  open my $out, '>', $secret_file or return;
+  close $out;
+  unlink $secret_file;
+  return 1;
+}
+
+sub write_secret_file ($secret_file, $secret_data) {
+  ## Open out a wee file and change the permissions... probably you can do this all in one but I dont know how.
+  open my $out, '>', "$secret_file" or return _ERROR("Could not open for writing [$secret_file].");
+  close $out;
+  chmod 0600, "$secret_file" or return _ERROR("Could not chmod 0600 [$secret_file].\n");
+  open $out, '>>', "$secret_file" or return _ERROR("Could not open for appending [$secret_file].\n");
+  print $out  $secret_data;
+  close $out;
+  chmod 0400, "$secret_file" or return _ERROR("Could not chmod 0400 [$secret_file].\n");
+  return 1;
+}
+
+sub check_permissions ($basic_lock_file, $file_name) {
+  if ( -e $file_name ) {
+    #my ($dev,$ino,$mode,$nlink,undef,undef,$rdev ) ,$size, $atime,$mtime,$ctime,$blksize,$blocks) = stat($file_name);
+    my (undef,undef,$mode,$nlink,undef,undef,$rdev ) = stat($file_name);
+    return 1 if ( $nlink == 1  and  ($mode == 33024 or $mode == 32768 or $mode == 33152) and $rdev == 0 );
+    unlink $basic_lock_file;
+    die "The file permissions on [$file_name] are incorrect. No links. Owner only. No funny business.\nPlease execute:\n   chmod 600 $file_name\nand re-run.\n";
+  }
+  else {
+    die "The file [$file_name] does not exist... this is probably bad...argggggghhhhhhh...\n";
+  }
+}
+
+
+  #print $out  unpack ("H*", gVault::encrypt('master', $p) );
+
+sub _ERROR ($message) {
+  return if not $message;
+  chomp $message;
+  print STDERR $message . "\n";
+  return;
+}
+
+sub _INFO ($message) {
+  return if not $message;
+  chomp $message;
+  print $message . "\n";
+}
+
+sub check_bash {
+   my ($name) = @_;
+   if (!$name) {
+      return 1;
+   }
+   my @parts = split(/'/,$name,-1); # limit is negative to catch trailing quote
+   my $res;
+   if (@parts == 1) {
+      return 1;
+   }
+   elsif (@parts > 1) {
+      return 0;
+   }
+   else {
+      die "Weird number of parts: @parts"
+   }
+   return 2;
+}
+
+sub escapeForBash {
+   my ($name) = @_;
+   if (!$name) {
+      return;
+   }
+   my @parts = split(/'/,$name,-1); # limit is negative to catch trailing quote
+   my $res;
+   if (@parts == 1) {
+      $res = "'$name'"
+   }
+   elsif (@parts > 1) {
+      $res = '$(echo ';
+      my $first = 1;
+      for my $part (@parts) {
+         $res .= "\"'\"" unless $first;
+         $first = 0;
+         $res .= "'";
+         $res .= $part;
+         $res .= "'";
+      }
+      $res .= ')';
+   }
+   else {
+      die "Weird number of parts: @parts"
+   }
+   return $res
+}
+
+sub save_secrets  ($secret_name, $secret_file, $actual_secrets) {
+  return gVault::save_secrets ($secret_name, $secret_file, $actual_secrets );
+}
+
+sub load_secrets ($secret_file) {
+  return gVault::load_secrets ( $secret_file );
+}
+
+sub session_dec ($what) {
+  return gVault::session_dec($what);
+}
+
+sub session_enc ($what) {
+  return gVault::session_enc($what);
+}
+
+sub dec_aes_rc6($x, $what) {
+  return gVault::dec_aes_rc6($x, $what);
+}
+
+sub enc_aes ($x, $what) {
+  return gVault::enc_aes($x, $what);
+}
+
+sub enc_ser ($x, $what) {
+  return gVault::enc_ser ($x, $what);
+}
+
+sub enc_aes_rc6 ($x, $what) {
+  return gVault::enc_aes_rc6($x,$what);
+}
+
+sub get_pid_data ($pid) {
+  return if not looks_like_number($pid);
+  if ( my $data = load_a_file("/proc/$pid/stat") ) {
+    my @pid_stat = split(/ /, $data, 23);
+    my $data;
+    if ( @pid_stat > 22 ) {
+      $data->{uid}   = load_a_file("/proc/$pid/loginuid");
+      $data->{cmd}   = load_a_file("/proc/$pid/cmdline");
+      $data->{pid}   = $pid_stat[0];
+      $data->{state} = $pid_stat[2];
+      $data->{ppid}  = $pid_stat[3];
+      $data->{tty}   = $pid_stat[6];
+      $data->{start} = $pid_stat[21];
+      return (keccak512( from_hex('ff6c0578f1a26bb0316d15c937610772bba99680b8f5e85d6aa6ebe5') . blake2b_256($pid_stat[0]).  blake2b_256($pid_stat[1]).  blake2b_256($pid_stat[3]).  blake2b_256($pid_stat[4]).  blake2b_256($pid_stat[5]).  blake2b_256($pid_stat[6]).  blake2b_256($pid_stat[7]).  blake2b_256($pid_stat[17]).  blake2b_256($pid_stat[18]).  blake2b_256($pid_stat[19]).  blake2b_256($pid_stat[21]) ), $data);
+    }
+  }
+  return;
+}
+
+
+sub load_a_file ($file_name) {
+  # loads upto 512 bytes from a $file_name
+  if ( -r $file_name ) {
+    if ( open (my $fh, '<', $file_name) ) {
+      if ( my $read_ok  = sysread ( $fh, my $data, 512 ) ) {
+        return $data if defined $read_ok;
+        #_ERROR( "The file [$file_name] returned no data.");
+        return;
+      }
+    }
+    else {
+      #_ERROR( "The file [$file_name] could not be loaded." );
+    }
+  }
+  else {
+    #_ERROR( "The file [$file_name] could not be read." );
+  }
+  return;
+}
+
+
+sub socket_send ($data) {
+  my $client =  IO::Socket::UNIX->new(
+      Type   => SOCK_STREAM(),
+      Peer   => $SOCK_PATH,
+  );
+  if ( $client ) {
+    if ( $ENV{_gvss_} ) {
+      print $client "SES:" . substr($ENV{_gvss_},0,64) . to_hex(enc_data($data)) . "\n";
+    }
+    else {
+      print $client "ENC:" . to_hex(enc_data($data)) . "\n";
+    }
+    $data = ''; 
+    if ( $client ) {
+      while (<$client>) {
+        $data = $_;
+      }
+    }
+    close $client;
+    chomp $data;
+    return $data;
+  }
+  return;
+}
+
+sub get_socket_auth {
+  return socket_send ("GIVE gvid=$ENV{_gvid_}  data=$ENV{_gv_}") if $ENV{_gvid_}  and  $ENV{_gvid_};
+  return;
+}
+
+
+sub enc_data  {
+  return if not $_[0];
+  # A simple yet effective encryption between real-time UNIX sockets... uses real-time PID data + some pepper.
+  my ($d, undef)= get_pid_data($$);
+  my ($secret, $iv);
+  if ( $ENV{_gvss_} and length($ENV{_gvss_}) == 128 ) {
+    $d = keccak512  ( $d . from_hex(substr($ENV{_gvss_}, 64, 64)) );
+  }
+  else {
+    $d = keccak512  ( $d );
+  }
+  $secret = substr ($d,  9, 32);
+  $iv     = substr ($d, 47, 16);
+  return $g_two->encrypt ( $_[0], $secret, $iv );
+}
+
+
+sub find_pid {
+  my $search = $_[0];
+  return if not defined $search;
+  my $got = 0;
+  my $pid = 0;
+  my $cmd;
+  foreach my $pid_path ( glob('/proc/*') ) {
+    if ( $pid_path=~m/\/proc\/[0-9]+$/) {
+    if ( my $check = load_a_file ("$pid_path/cmdline") ) {
+      if ( $check=~m/$search/m ) {
+        if ( $pid_path=~m/\/proc\/([0-9]+)/ ) {
+          if ( $1 != $$ ) {
+            $pid = $1;
+            $cmd = $check;
+            $got++;
+          }
+        }
+      }
+    }
+    }
+  }
+
+  if ( $got == 1 ) {
+    my $small_cmd = $cmd;
+    if ( length($small_cmd) > 110 ) {
+      $small_cmd = substr($small_cmd,0,110) . "...[cut].";
+    }
+    _ERROR ("I'm using command [$small_cmd] with PID [$pid] as input.");
+    return $pid;
+  }
+  elsif ( $got > 1 ) {
+    return _ERROR("The PID data matched more than one PID so that doesn't work for me...");
+  }
+  else {
+    return _ERROR("The PID data matched nothing.");
+  }
+  return;
+}
+
+sub trap_env {
+  my $env;
+  foreach my $e (keys %ENV) {
+    if ( $e=~m/^_gv_/ and length($e) == 36) {
+      $env->{$e} = session_enc($ENV{$e});
+    }
+  }
+  return $env;
+}
+
+
+sub from_hex {
+  return pack 'H*', $_[0] if $_[0];
+  return;
+}
+
+sub encode_85 {
+  my $_space_no = unpack 'N', ' ' x 4;
+	my ($in, $opt) = @_;
+	my $compress_zero = exists $opt->{compress_zero} ? $opt->{compress_zero} : 1;
+	my $compress_space = $opt->{compress_space};
+
+	my $padding = -length($in) % 4;
+	$in .= "\0" x $padding;
+	my $out = '';
+
+	for my $n (unpack 'N*', $in) {
+		if ($n == 0 && $compress_zero) {
+			$out .= 'z';
+			next;
+		}
+		if ($n == $_space_no && $compress_space) {
+			$out .= 'y';
+			next;
+		}
+
+		my $tmp = '';
+		for my $i (reverse 0 .. 4) {
+			my $mod = $n % 85;
+			$n = int($n / 85);
+			vec($tmp, $i, 8) = $mod + 33;
+		}
+		$out .= $tmp;
+	}
+
+	$padding or return $out;
+
+	$out =~ s/z\z/!!!!!/;
+	substr $out, 0, length($out) - $padding
+}
+
+
+sub writeout_gv_sh {
+
+  return '#!/bin/sh
+# IMPORANT:
+#  If you enable PARANOID mode (which is the default) then this script forms part of your master password.
+#  It is important to understand that... please refer to the documentation and read about "paranoid" mode.
+#  As I am a PARANOID ANDROID then I set this as the default, probably this will catch some people out...!
+#     (sorry about that)
+
+###  set-up  ###
+     VERSION=' . VERSION . '
+      G_HASH=' . escapeForBash ( encode_85(random_bytes(32)) ) . '
+    PARANOID=
+G_USER_VAULT=' . escapeForBash ( encode_85(random_bytes(64)) ) . '
+
+
+
+if ! [ -n "$1" ]; then
+   exit 1
+fi
+
+
+if [ -n "$2" ]; then
+     PARANOID=1
+
+    if ! [ -n "$3" ]; then
+      exit 1
+    fi
+
+    G_HASH=$3
+fi
+
+
+ FIXED_DISKS=
+CHECK_IP_INT=
+CHECK_IP_EXT=
+CHECK_MY_ISP=
+KEYBOARD_ENT=
+EXTERNAL_SSL=
+ YOUR_CUSTOM=
+
+if [ -n "$FIXED_DISKS" ]; then
+  DISKS=`lsblk | sort | md5sum`
+fi
+
+if [ -n "$CHECK_IP_EXT" ]; then
+  MY_IP_EXT=`curl -s https://api64.ipify.org`
+fi
+
+if [ -n "$CHECK_IP_INT" ]; then
+  MY_IP_INT=`/usr/sbin/ifconfig | grep inet`
+fi
+
+if [ -n "$CHECK_MY_ISP" ]; then
+  ISP_IP=`curl -s https://api64.ipify.org`
+  MY_ISP=`curl -s https://api.iplocation.net/?ip=$ISP_IP | json_pp | grep isp`
+fi
+
+if [ -n "$PARANOID" ]; then
+  SHA_5SUM=`/usr/local/_gvault/sys/cat /usr/local/_gvault/sys/sha512sum    | /usr/local/_gvault/sys/md5sum`
+   MD5_SUM=`/usr/local/_gvault/sys/cat /usr/local/_gvault/sys/md5sum       | /usr/local/_gvault/sys/sha512sum`
+   GV_SEND=`/usr/local/_gvault/sys/cat /usr/local/_gvault/bin/g_vault_send | /usr/local/_gvault/sys/md5sum`
+  GV_VAULT=`/usr/local/_gvault/sys/cat /usr/local/_gvault/sys/gvaultd      | /usr/local/_gvault/sys/md5sum`
+   G_VAULT=`/usr/local/_gvault/sys/cat /usr/local/_gvault/bin/gvault       | /usr/local/_gvault/sys/md5sum`
+   CAT_SUM=`/usr/bin/cat               /usr/local/_gvault/sys/cat          | /usr/local/_gvault/sys/md5sum`
+fi
+
+if [ -n "$KEYBOARD_ENT" ]; then
+  KEYBOARD=`/usr/local/_gvault/sys/_gvault_enter_password_via_keyboard 64 96 1`
+fi
+
+if [ -n "$EXTERNAL_SSL" ]; then
+  SSL=`/usr/local/_gvault/sys/_gvault_enter_password_via_https`
+fi
+
+if [ -n "$YOUR_CUSTOM" ]; then
+  CUSTOM=1
+fi
+
+
+# put everything together ready to send to the gVault daemon
+# send the data to gVault daemon control using a UNIX socket. PID=$1  which is the argument passed to this BASH script
+# gVault utilises PID authentication in-addition to everything else so we want to authorise the calling PID, not the PID of this script!
+# and send the data back to the main calling script.
+
+_gv_inter="${DISKS} ${MY_IP_INT} ${MY_IP_EXT} ${MY_ISP} ${SHA_5SUM} ${MD5_SUM} ${GV_SEND} ${GV_VAULT} ${CAT_SUM} ${KEYBOARD} ${SSL} ${CUSTOM} ${G_USER_VAULT} ${G_VAULT} ${G_HASH} ${PARANOID} ANDROID!"
+  _gv_sha=`echo $_gv_inter | /usr/local/_gvault/sys/sha512sum`
+ _gv_auth=`echo AUTH gvid=$_gvid_ pid=$1 data=$_gv_sha v=$VERSION para=$PARANOID | /usr/local/_gvault/bin/g_vault_send`
+echo $_gv_auth';
+}
+
+
+
+sub make_printable_secret {
+  my $secret;
+  for (my $pass=0; $pass<=31; $pass++) {
+    my ($continue, $r, $f);
+    while ( not $continue ) {
+      $r = random_bytes(1);
+      $f=ord($r);
+      if ( ($f>32)  and  ( $f!=34 and $f!=92  and  $f!=39 and $f!=47 and  $f!=96  and $f<127)  ) {
+        $continue = 1;
+      }
+    }
+    $secret .= $r;
+  }
+  return $secret;
+}
+
+
+#    /usr/bin/srm
+#    /bin/sh
+#    /usr/bin/rm
+#    /usr/bin/srm
+#    /usr/bin/systemctl
+#    /usr/bin/at
+#    /usr/sbin/ifconfig
+#    /usr/bin/cat
+#    /usr/bin/uptime
+#    /usr/bin/env 
+#    /usr/bin/nohup
+#    /usr/bin/md5sum 
+#    /usr/bin/sha512sum   
+#    /bin/kill
+#    /usr/sbin/nologin
+#    /usr/sbin/chpasswd 
+#    /usr/bin/chmod
+#    /usr/bin/curl
+

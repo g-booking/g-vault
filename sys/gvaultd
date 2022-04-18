@@ -1,0 +1,863 @@
+#!/usr/local/_gvault/bin/perl
+use v5.20;
+use strict;
+no warnings qw(experimental::signatures);
+use feature qw(signatures);
+
+$| = 1;
+
+$SIG{PIPE} = \&handle_signal; $SIG{USR1}= \&handle_signal; $SIG{HUP}=  \&handle_signal; $SIG{TERM}= \&handle_signal; $SIG{INT}=  \&handle_signal;
+
+use Syntax::Keyword::Try;
+use File::Basename;
+use IO::Socket;
+use IO::Handle::Record;
+use IO::Select;
+use IO::Socket::UNIX;
+use Linux::Systemd::Daemon ':all';
+use Linux::Systemd::Journal::Write;
+use Crypt::Mode::CBC;
+use Crypt::PRNG                qw( rand random_bytes );
+use Crypt::Digest::BLAKE2b_512 qw( blake2b_512       );
+use Crypt::Digest::BLAKE2b_256 qw( blake2b_256 blake2b_256_file );
+use Crypt::Digest::Keccak512   qw( keccak512         );
+use Crypt::Mac::BLAKE2b        qw( blake2b           );
+use Crypt::Digest::BLAKE2s_128 qw( blake2s_128       );
+use Scalar::Util               qw( looks_like_number );
+use Storable                   qw( thaw              );
+##use Data::Dump                 qw( dump             );  # (dont use in production)
+sd_notify(starting => 1, status => 'g-Vault secret service is starting up.');
+
+my ( $PIDS, $socket, $inode, $conn_tracker, $session_secret, $_session_secret, $users, $commands, $sessions );
+my $syslog     = Linux::Systemd::Journal::Write->new;
+my $SOCK_PATH  = "/usr/local/_gvault/sock/.gvault.sock";
+my $g_two      = Crypt::Mode::CBC->new('TwoFish', 1, 16);
+my $sel        = IO::Select->new();
+my $conn_count = 0;
+my $gv_u_id;
+
+#### START #####
+setup() or exit 1;
+main();
+
+sub full_dump {
+
+  return (
+     "Commands=["   . keys (%{$commands}) . "]   " .
+     "Conn_track=[" . keys (%{$conn_tracker}) . "]   " .
+     "Users=["      . keys (%{$users}) . "]   " .
+     "Sessions=["   . keys (%{$sessions}) . "]   " .
+     "PIDS=["       . keys (%{$PIDS}) . "]   " );
+}
+
+
+
+sub user_clean_up {
+
+  # PIDS
+  foreach my $pid (keys %{$PIDS}) {
+    delete $PIDS->{$pid} if  (time() - $PIDS->{$pid}) >= 30 ;
+  }
+
+
+  # commands
+  foreach my $key_public (keys %{$commands}) {
+     my $active_pid = session_dec($commands->{$key_public}->{pid});
+     if ( $active_pid and not -e "/proc/$active_pid" ) {
+       #syslog ("Clean up, Active PID [$active_pid] is not active.");
+       delete  $commands->{$key_public};
+     }
+  }
+
+  # conn_tracker
+  if ( defined $conn_tracker ) {
+    foreach my $key (keys( %{$conn_tracker})) {
+      remove_unix_socket($key) if  (time() - $conn_tracker->{$key}->{time}) >= 30;
+    }
+    undef $conn_tracker if keys( %{$conn_tracker}) == 0;
+  }
+
+  # users
+  foreach my $user_id (keys %{$users}) {
+    if ( $users->{$user_id} )  {
+      foreach my $user_key (keys %{$users->{$user_id}}) {
+
+        my $pid = $users->{$user_id}->{$user_key}->{pid_d}->{pid};
+        if ( not -e "/proc/$pid" ) {
+          # We want to delete this user session but let's check if it's linked to an external auth and if so, is the external auth actually alive?
+          my $want_to_delete = 1;
+          if ( $users->{$user_id}->{$user_key}->{external} ) {
+            my $c = $commands->{$users->{$user_id}->{$user_key}->{external}};
+            if ( $c->{pid} and ( -e "/proc/" . session_dec($c->{pid}))  ) {
+              ##syslog ("Not deleting as external process still running although the session has closed itself.");
+              $want_to_delete = 0;
+            }
+          } 
+          if ( $want_to_delete ) {
+            delete $users->{$user_id}->{$user_key};
+            #_ERROR ("gVault removed authorised session PID [$pid] as it's no longer alive and no longer required.");
+          }
+        }
+
+      }
+    }
+    if ( keys %{$users->{$user_id}} == 0 ) {
+      #_ERROR ("gVault gUID [" . to_hex(blake2s_128(session_dec($user_id))) . "] has logged out all sessions and has been removed.");
+      delete $users->{$user_id};
+    }
+    if ( keys %{$users} == 0 ) {
+      undef $users;
+      #_ERROR ("gVault, all users sessions have been removed.");
+    }
+  }
+
+  # sessions
+  foreach my $pid ( keys  %{$sessions->{pids}} ) {
+    if ( not -e "/proc/" . session_dec($pid) ) {
+      my $key = $sessions->{pids}->{$pid};
+      delete $sessions->{$key};
+      delete $sessions->{pids}->{$pid};
+      #_ERROR ("gVault removed session secret PID [" . session_dec($pid) . "] as it's no longer alive.");
+      delete $sessions->{pids} if keys %{ $sessions->{pids} } == 0;
+    }
+  }
+  #syslog ("gVault connection tracker is empty.") if not defined $conn_tracker;
+}
+
+
+sub main {
+  my $ct = (15 * 60); ### clean every 15 mins
+  my $clean_up_time = time() + $ct;
+  $0 = "gVault is ready and accepting incoming connections.";
+  while ( 1 ) {
+    if ( time() > $clean_up_time ) { user_clean_up(); $clean_up_time = time() + $ct; }
+    while(my @ready = $sel->can_read(115)) {
+      foreach my $fh (@ready) {
+        if($fh == $socket) {
+          # Create a new socket
+          if ( $inode != inode() ) {
+            syslog("The gVault sock [$SOCK_PATH] inode has changed. This is very bad and generally means a hack attempt is in progress.");
+            syslog("The gVault is closing as a precaution.");
+            closedown();
+          }
+          my $new = $socket->accept;
+          $sel->add($new);
+          $conn_count++;
+          my ($pid, $uid, $gid) = $new->peercred;
+          $conn_tracker->{$new}->{pid}    = $pid;
+          $conn_tracker->{$new}->{uid}    = $uid;
+          $conn_tracker->{$new}->{gid}    = $gid;
+          $conn_tracker->{$new}->{time}   = time();
+          $conn_tracker->{$new}->{hash}   = blake2b_512 ( $pid . random_bytes(8) . $uid . $gid );
+          $conn_tracker->{$new}->{handle} = $sel->exists ($new);
+          sd_notify(watchdog => 1, status => "New connection from PID [$pid].");
+        }
+        else {
+          # Process socket
+          sd_notify(watchdog => 1, status => "Analysing PID [$conn_tracker->{$fh}->{pid}].");
+          my $data = <$fh>; ### if $fh->can_read;
+          if ( $data ) {
+            chomp $data;
+            try {
+              data_in($data, $fh, $conn_tracker->{$fh}->{pid});
+            }
+            catch {
+              syslog ("ERROR: $@");
+            }
+          }
+          remove_unix_socket ($fh);
+        }
+      }
+      if ( time() > $clean_up_time ) { user_clean_up(); $clean_up_time = time() + $ct; }
+    }
+    sd_notify(watchdog => 1, status => "gVault is ready.");
+  }
+}
+
+sub check_gvault_user {
+  $gv_u_id = getpwnam ("g_vault");
+  return _ERROR ( "You must create a user named 'g_vault' before the gVault daemon may start.") if not $gv_u_id;
+  my @uinfo   = getpwuid($gv_u_id);
+  return _ERROR ( "You must set a password for the user named 'g_vault' before the gVault daemon may start.") if length($uinfo[1]) < 10;
+  return _ERROR ( "You must NOT set a SHELL for the user named 'g_vault'.") if $uinfo[8]=~m/sh/;
+  return 1;
+}
+
+sub change_user {
+  my $gv_u_id = getpwnam ("g_vault") or return;
+  my @uinfo   = getpwuid($gv_u_id) or return;
+  $> = $gv_u_id;
+  if (  $> == $gv_u_id ) {
+    _ERROR ("gVault daemon is running as user [g_vault].");
+    return 1;
+  }
+  return;
+}
+
+
+
+sub get_g_vault_passwd {
+  my $gv_u_id = getpwnam ("g_vault");
+  my @uinfo   = getpwuid($gv_u_id);
+  return  blake2b_256( keccak512( from_hex("2438481e40") . $uinfo[1] . from_hex("3154413d33380a620f5f3219281b4c") ) );
+}
+
+sub setup {
+  check_gvault_user() or return;
+  make_session   ();
+  check_sock_path() or return;
+
+  $socket = new IO::Socket::UNIX(
+      Type   => SOCK_STREAM,
+      Local  => $SOCK_PATH,
+      Listen => SOMAXCONN,
+      Timeout=> 30,
+  );
+  _ERROR( "Could not create the g-booking UNIX socket [$SOCK_PATH].") if not $socket;
+  exit 1 if not $socket;
+
+  $inode = inode();
+  $sel->add($socket);
+  chmod 0777, $SOCK_PATH;
+  syslog (session_dec(session_enc("gVault is ready and listening @ $SOCK_PATH")));
+  sd_notify(ready => 1, status => 'gVault is ready.');
+  change_user() or return;
+  return 1;
+}
+ 
+sub closedown {
+  sd_notify(stopping => 1, status => 'Shutting down...');
+  undef $socket;
+  unlink $SOCK_PATH;
+  syslog ("g-Booking's gVault has stopped.");
+  exit;
+}
+
+sub data_in ($data, $fh, $pid) {
+  return if length($data) < 20;
+  try {
+    if ( substr( $data,0,4 ) eq 'ENC:' ) {
+      $data = dec_data( substr($data,4), $pid, '');
+    }
+    elsif ( substr( $data,0,4 ) eq 'SES:' ) {
+      my $session_key   = session_enc(from_hex(substr( $data, 4, 64 )));
+      if ( $sessions->{$session_key}  ) {
+        my $check_pid = session_dec( $sessions->{$session_key}->{pid} );
+        if ( walk_back_pid ( $pid, $check_pid, undef, undef, undef ) ) {
+          $data = dec_data( substr($data, 68), $pid, session_dec($sessions->{$session_key}->{hash}) );
+        }
+        else {
+          investigate($pid);
+          syslog("AUTH_COMP. !!WARNING!! Your credentials are compromised...");
+          return;
+        }
+      }
+      else {
+        return;
+      }
+    }
+    return if not $data or length($data) < 8;
+    if ( $data=~m/^GIVE\s+gvid\=(.*?)\s+data\=(.*?)\s*$/ ) {
+      if ( $1 and $2 ) {
+        my $key;
+        my $user_id = session_enc ( blake2b_512( from_hex($1) ));
+           $key     = session_enc ( from_hex   ( $2 ));
+           $key     = session_enc ( from_hex   ( substr($2,9) )) if substr($2,0,9) eq 'g_vaultd_';
+        if ( $users->{$user_id} and $users->{$user_id}->{$key} and $users->{$user_id}->{$key}->{master} )  {
+          my ($d_pid, undef) = get_pid_data($pid);          
+       
+          if ( auth_pid_check(0, 'GIVE', $pid, session_dec($users->{$user_id}->{$key}->{upid}), $users->{$user_id}->{$key}->{pid_d} )  or  $PIDS->{ $d_pid } ) {
+            my $handle = $sel->exists (  $conn_tracker->{$fh}->{handle} );
+            print_to_handle ($handle, (to_hex ( session_dec($users->{$user_id}->{$key}->{master}) ) ) ) if $handle;
+            return 1 if $handle;
+            return;
+          }
+          else {
+            my $h_pid = get_pid_data($pid);          
+            investigate($pid);
+            investigate($h_pid->{ppid});
+            syslog ("AUTH_COMP. !!WARNING!! Your credentials are compromised from UID [$h_pid->{uid}], gUID [" . to_hex(blake2s_128(session_dec($user_id))) . "], PID [$pid], PPID [$h_pid->{ppid}], CMD [$h_pid->{cmd}].") if $h_pid and $h_pid->{cmd};
+            syslog ("AUTH_COMP. !!WARNING!! Your credentials are compromised from PID [$pid].") if not $h_pid;
+            return;
+          }
+        }
+        else {
+          # No interactive data here... do we warn?
+          my $h_pid = get_pid_data($pid);          
+          my $ccc = $h_pid->{cmd};
+          $ccc=~s/\0/ /g;
+          syslog ("AUTH_WARN. No interactive data for UID [$h_pid->{uid}], gUID [" . to_hex(blake2s_128(session_dec($user_id))) . "], PID [$pid], PPID [$h_pid->{ppid}], CMD [$ccc].") if $h_pid and $h_pid->{cmd};
+          syslog ("AUTH_WARN. No interactive data for PID [$pid].") if not $h_pid;
+          return;
+        }
+      }
+    }
+    elsif ( $data=~m/^AUTH\s+gvid\=(.*?)\s+pid\=(.*?)\s+data\=(.*?)\s+v\=(.*?)\s+para\=(.*?)\s*$/ ) {
+      my ( $master, $user_id );
+      my $gvid = $1;
+      my $upid = $2;
+      my $data = $3;
+      my $vers = $4;
+      my $para = $5;
+      #  
+      $user_id = session_enc ( blake2b_512( from_hex($1) ) ) if lc($gvid)=~m/([\da-f]+)/ and  length($1) == 64;
+      $master  = session_enc ( blake2b_512( $vers . keccak512 ( '*' . from_hex($1) . session_dec($session_secret->{global}) ) . $para ) ) if lc($data)=~m/([\da-f]+)/ and  length($1) == 128;
+      undef $gvid; 
+      undef $data; 
+      my $super_para = "I'm not paranoid.....";
+      if ( $user_id and $master and looks_like_number($upid) and my $paranoid=auth_pid_check($para, 'AUTH', $pid, $upid, 0) and my $pid_data = get_pid_data ($upid) ) {
+        if ( $para ) {
+            $super_para .= blake2b_256_file ("/usr/local/bin/gvault") or return _ERROR("Para wara cannot find a file I was looking for");
+            $super_para .= blake2b_256_file ("/usr/local/bin/gencrypt") or return _ERROR("Para wara cannot find a file I was looking for");
+            $super_para .= blake2b_256_file ("/usr/local/bin/gdecrypt") or return _ERROR("Para wara cannot find a file I was looking for");
+            $super_para .= blake2b_256_file ("/usr/local/bin/g_vault_send") or return _ERROR("Para wara cannot find a file I was looking for");
+            $super_para .= blake2b_256_file ("/usr/local/_gvault/lib/gVault.pm") or return _ERROR("Para wara cannot find a file I was looking for");
+            $super_para .= blake2b_256_file ("/usr/local/_gvault/sys/gvaultd") or return _ERROR("Para wara cannot find a file I was looking for");
+        }
+        $master  = session_enc ( blake2b_512 ( session_dec($master) . $paranoid       . $super_para ) ) if $paranoid;
+        my $etc  = session_enc ( keccak512   ( session_dec($master) . '_session_etc_' . $gvid ) );
+        my $h_pid = get_pid_data($upid);          
+        my $guid = to_hex(blake2s_128(session_dec($user_id)));
+        syslog ("AUTH_PASS. gVault session success from UID [$h_pid->{uid}], gUID [$guid], PID [$upid], PPID [$h_pid->{ppid}].") if $h_pid and $h_pid->{cmd};
+        syslog ("AUTH_PASS. gVault session success from gUID [$guid], PID [$upid].")                                             if not $h_pid;
+        my $key = session_enc ( random_bytes(40) );
+        $users->{$user_id}->{$key}->{upid}   = session_enc ( $upid  );
+        $users->{$user_id}->{$key}->{master} = $master;
+        $users->{$user_id}->{$key}->{pid_d}  = $pid_data;
+        $users->{$user_id}->{$key}->{etc}    = $etc;
+        my $handle = $sel->exists (  $conn_tracker->{$fh}->{handle} );
+        print_to_handle ($handle, "g_vaultd_" . to_hex( session_dec($key) ) ) if $handle;
+        return 1;
+      }
+      elsif ( not looks_like_number($upid) ) {
+        syslog("AUTH_FAIL. PID requires to be a number. I didn't get that.");
+        return;
+      }
+      elsif ( not $user_id ) {
+        syslog("AUTH_FAIL. GVID requires a 64 byte HEX string. I didn't get that.");
+        return;
+      }
+      elsif ( not $master ) {
+        syslog("AUTH_FAIL. Auth requires a 128 byte HEX string which is a SHA-512 HASH of the interactive input. I didn't get that.");
+        return;
+      }
+      else {
+        my $h_pid = get_pid_data($upid);          
+        syslog ("AUTH_FAIL. PID mismatch found from UID [$h_pid->{uid}], gUID [" . to_hex(blake2s_128(session_dec($user_id))) . "], PID [$upid], PPID [$h_pid->{ppid}], CMD [$h_pid->{cmd}].") if $h_pid and $h_pid->{cmd};
+        syslog ("AUTH_FAIL. PID mismatch found from PID [$upid].") if not $h_pid;
+        return;
+      }
+    }
+    elsif ( $data=~m/^CMD\s+data\=(.*?)\s*$/ ) {
+      my $chk_length = length($1);
+      if  ( lc($1)=~m/([\da-f]+)/ ) {
+        return if $chk_length != length($1);
+      }
+      if ( thaw(from_hex($1))  and   thaw(from_hex($1))->{pid}  and  thaw(from_hex($1))->{pid_start} ) {
+        my $g_name;
+        $g_name = thaw(from_hex($1))->{gv_load} or return;
+        my $enc_key_public  = session_enc ( blake2b_256 ( from_hex('162d') . thaw(from_hex($1))->{pid} . keccak512 ( from_hex('cc8d9083a053ff08bca3ce2299ef749e') .  thaw(from_hex($1))->{suid} . thaw(from_hex($1))->{exe_hash} . $g_name ) ) ); 
+        my $have_exe        = 0;
+        my $have_pid        = 0;
+        $have_pid           = 1 if  thaw(from_hex($1))->{pid_start} != -1;
+        $have_exe           = 1 if  thaw(from_hex($1))->{exe_hash};
+
+        if ( $commands->{$enc_key_public} ) {
+          my $active_pid = session_dec($commands->{$enc_key_public}->{pid});
+          if ( not -e "/proc/$active_pid" ) {
+            syslog ("Active PID [$active_pid] is not active."); 
+            delete  $commands->{$enc_key_public};
+          }
+        }
+
+        if ( not $commands->{$enc_key_public} ) {
+          my $enc_key_secret = session_enc ( (random_bytes(40)) );
+          my $secret         = substr( blake2b_512( $enc_key_public . keccak512 ( from_hex('84b678f16e905d22194ba2d8') . blake2b_256 ( session_dec ($enc_key_secret) ) ) . from_hex('55151e16e19ae2e6a00584') ),4,32);
+          my $secret_iv      = substr( blake2b_512( $enc_key_public . keccak512 ( from_hex('c892463d83380bf8405a1c49') . blake2b_256 ( session_dec ($enc_key_secret) ) ) . from_hex('df937f5c42f57510b18c1dcc') ),38,16);
+          $commands->{$enc_key_public}->{env}  = session_enc (thaw(from_hex($1))->{env});
+          $commands->{$enc_key_public}->{gvn}  = session_enc (thaw(from_hex($1))->{gv_name});
+          $commands->{$enc_key_public}->{gvl}  = session_enc (thaw(from_hex($1))->{gv_load});
+          $commands->{$enc_key_public}->{cmd}  = session_enc ( $g_two->encrypt ( from_hex($1), $secret, $secret_iv ) );
+          $commands->{$enc_key_public}->{sec}  = $enc_key_secret;
+          $commands->{$enc_key_public}->{gv}   = session_enc (thaw(from_hex($1))->{_gv_});
+          $commands->{$enc_key_public}->{gvid} = session_enc (thaw(from_hex($1))->{_gv_id_});
+          $commands->{$enc_key_public}->{suid} = session_enc (thaw(from_hex($1))->{suid});
+          $commands->{$enc_key_public}->{name} = session_enc (thaw(from_hex($1))->{name});
+          $commands->{$enc_key_public}->{pid}  = session_enc (thaw(from_hex($1))->{pid})      if $have_pid == 1;
+          $commands->{$enc_key_public}->{exe}  = session_enc (thaw(from_hex($1))->{exe_path}) if $have_exe == 1;
+          $commands->{$enc_key_public}->{hash} = session_enc (thaw(from_hex($1))->{exe_hash}) if $have_exe == 1;
+          $commands->{$enc_key_public}->{uid}  = session_enc ( $conn_tracker->{$fh}->{uid} );
+          my $key     = session_enc ( from_hex ( substr(session_dec($commands->{$enc_key_public}->{gv}),9) )) if substr(session_dec($commands->{$enc_key_public}->{gv}),0,9) eq 'g_vaultd_';
+          my $user_id = session_enc ( blake2b_512( from_hex(session_dec($commands->{$enc_key_public}->{gvid})) )) if $key;
+          if ( $user_id and $key and $users->{$user_id} and $users->{$user_id}->{$key} ) {
+            $users->{$user_id}->{$key}->{external} = $enc_key_public;
+          } 
+
+          my $handle = $sel->exists (  $conn_tracker->{$fh}->{handle} );
+          print_to_handle ($handle, "SUCCESS.");
+        }
+        else {
+          my $secret     = substr(blake2b_512($enc_key_public.keccak512(from_hex('84b678f16e905d22194ba2d8').blake2b_256(session_dec($commands->{$enc_key_public}->{sec}))).from_hex('55151e16e19ae2e6a00584')),4,32);
+          my $secret_iv  = substr(blake2b_512($enc_key_public.keccak512(from_hex('c892463d83380bf8405a1c49').blake2b_256(session_dec($commands->{$enc_key_public}->{sec}))).from_hex('df937f5c42f57510b18c1dcc')),38,16);
+          my $handle     = $sel->exists (  $conn_tracker->{$fh}->{handle} );
+          my $active_uid = session_dec( $commands->{$enc_key_public}->{uid} );
+          my $current_uid= $conn_tracker->{$fh}->{uid};
+          if (  $active_uid == $current_uid ) {
+            delete $commands->{$enc_key_public};
+            print_to_handle ($handle, "DELETED.")               if $active_uid == $current_uid;
+          }
+          print_to_handle ($handle, "ACTIVE.  (not by you)") if $active_uid != $current_uid;
+        }
+      }
+      else {
+        investigate($pid);
+        syslog("gVault received a bad command which really should not ever happen. You may wish to investigate.");
+      }
+    }
+    elsif ( $data=~m/^data_dump\s*$/ ) {
+      my $handle     = $sel->exists (  $conn_tracker->{$fh}->{handle} );
+      print_to_handle ($handle, full_dump() );
+    }
+    elsif ( $data=~m/^SESSION\s+pid\=(.*?)\s+data\=(.*?)\s*$/ ) {
+      my $user_data = $2;
+      my $user_pid  = $1;
+      $user_data   = $1 if lc($user_data)=~m/([\da-f]+)/;
+   
+      if ( $user_pid and not looks_like_number($user_pid) ) {
+         syslog ("bad pid");
+         return;
+      }
+  
+      # We want to track sessions in a very limited way... so we do.... we use our auth crypt system with a little bit of pepper to get a unique twisto arano
+      # We're looking at the parent process here as gVault will be running so we go back one... to have accurate context... else we can only operate on PID.
+      ## hmmm.. actually, we might not be... let us capture the tty here i think??
+      ## or let the user specify the PID... for now we will capture and go back to TTY!
+  
+      if ( not $user_pid ) {
+        my $tty = get_pid_data($pid)->{tty};
+        if ( not looks_like_number($tty) ) {
+          syslog ("Looks like this might be an incompatible UNIX / LINUX, please let the author know...");
+          return;  
+        } 
+        ### walk backwards.......
+        my $ppid = -1;
+        $user_pid = $pid;
+        while ( get_pid_data($user_pid)->{tty} eq $tty ) {
+          $user_pid = get_pid_data($user_pid)->{ppid};
+          last if $user_pid == 0;
+        }
+        if ( $user_pid == 0 ) {
+          syslog ("Looks like this might be an incompatible UNIX / LINUX, please let the author know...");
+          return;  
+        }
+      }
+  
+      my $p_pid      = get_pid_data($user_pid);
+      if  ( not  walk_back_pid ( $pid, $user_pid, undef, undef, undef ) ) {
+          syslog ("I don't see that PID in your tree.");
+          return;  
+      } 
+  
+      if ( not $p_pid ) {
+        syslog ( "That PID does not exist." );
+        return;
+      }
+      my $session_key = session_enc(blake2b_256 ($user_data . $p_pid->{start} . $p_pid->{uid} . from_hex('97206ad463c4b3715b8fa9fb1832f9de0faf76b3ede9d7adbda86c900b7dbd70ba7c180c3c8dd7645e4cc1e402603f2b') . $p_pid->{pid} )); 
+      if ( not $sessions->{$session_key} ) {
+        $sessions->{pids}->{session_enc( $p_pid->{pid} )} = $session_key;
+        $sessions->{$session_key}->{pid}    = session_enc( $p_pid->{pid} );
+        $sessions->{$session_key}->{hash}   = session_enc( random_bytes(32) );
+        my $handle = $sel->exists (  $conn_tracker->{$fh}->{handle} );
+        my $sending = to_hex(session_dec($session_key) . session_dec($sessions->{$session_key}->{hash}));
+        print_to_handle ( $handle, to_hex(session_dec($session_key) . session_dec($sessions->{$session_key}->{hash})) ) if $handle;
+        #syslog("gVault has set a new dual encrypted session key for PID [$user_pid].") if $handle;
+      }
+      else {
+      }
+    }
+    elsif ( $data=~m/^EXTERNAL_CHECK$/  and $commands ) {
+      if ( my $enc_key_public = external_auth($pid) ) {
+          my $c;
+          my $enc_key_secret =   $commands->{$enc_key_public}->{sec} ;
+          my $secret         = substr( blake2b_512( $enc_key_public . keccak512 ( from_hex('84b678f16e905d22194ba2d8') . blake2b_256 ( session_dec ($enc_key_secret) ) ) . from_hex('55151e16e19ae2e6a00584') ),4,32);
+          my $secret_iv      = substr( blake2b_512( $enc_key_public . keccak512 ( from_hex('c892463d83380bf8405a1c49') . blake2b_256 ( session_dec ($enc_key_secret) ) ) . from_hex('df937f5c42f57510b18c1dcc') ),38,16);
+          my ( $d_pid, $h_pid ) = get_pid_data($pid);          
+          # Final check for user... it has passed all the other tests... so we check UID here, probably should do before but I added UID in
+          my $suid  = session_dec( $commands->{$enc_key_public}->{suid} );
+
+          $c->{cmd} = session_dec( $commands->{$enc_key_public}->{cmd} );
+          $c->{gvl} = session_dec( $commands->{$enc_key_public}->{gvl} );
+          $c->{exe} = session_dec( $commands->{$enc_key_public}->{exe} );
+
+          if ( looks_like_number ($suid) ) {
+            return _ERROR ("FAILED external access to g-Vault [$c->{gvl}] to [$c->{exe}], real UID detected as 'root' and we needed [$suid].") if  ( $suid != $h_pid->{uid}  and $h_pid->{uid} == 0);
+            return _ERROR ("FAILED external access to g-Vault [$c->{gvl}] to [$c->{exe}], UID incorrect, we got [$h_pid->{uid}], and we needed [$suid].")  if ( $suid != $h_pid->{uid}  and $h_pid->{uid} != 0);
+          }
+          my $handle = $sel->exists (  $conn_tracker->{$fh}->{handle} );
+          print_to_handle ( $handle, to_hex($g_two->decrypt (  $c->{cmd}, $secret, $secret_iv )) );
+          syslog ("GRANTED external access to g-Vault [$c->{gvl}] to [$c->{exe}], UID [$suid] PPID [$h_pid->{ppid}], PID [$pid].") if not defined $PIDS->{$d_pid};
+          $PIDS->{$d_pid} = time();
+          return 1;
+      }
+      return;
+    }
+    elsif ( $data=~m/^EXTERNAL_CHECK$/ ) {
+      # gVault not using daemon... we don't bother to report anymore
+      return;
+    }
+    else {
+      investigate($pid);
+      syslog("gVault received a bad command [$data] which really should not ever happen. You may wish to investigate.");
+    }
+  }
+  catch {
+    investigate($pid);
+    syslog("gVault received a bad command which really should not ever happen.");
+  }
+  return;
+}
+
+sub external_auth ($pid) {
+  foreach my $enc_key_public ( keys %${commands} ) {
+    my ( $check_pid,  $check_exe,  $check_hash, $check_name );
+    $check_pid  = session_dec ( $commands->{$enc_key_public}->{pid}  );
+    $check_exe  = session_dec ( $commands->{$enc_key_public}->{exe}  )  if $commands->{$enc_key_public}->{exe};
+    $check_hash = session_dec ( $commands->{$enc_key_public}->{hash} )  if $commands->{$enc_key_public}->{hash};
+    $check_name = session_dec ( $commands->{$enc_key_public}->{name} )  if $commands->{$enc_key_public}->{name};
+
+    $check_name = '' if not defined $check_name;
+    if ( $check_pid ) {
+      if ( walk_back_pid ($pid, $check_pid, $check_exe, from_hex($check_hash), $check_name) ) {
+        #syslog ("OK, we matched [$pid] with [$check_pid]   [$check_name]");
+        return $enc_key_public;
+      }
+    }
+  }
+  return;
+}
+
+sub print_to_handle ($handle, $what) {
+  try {
+    print $handle ($what . "\n") if defined $what and defined $handle;
+  }
+  catch {
+    syslog ($@);
+  }
+  return 1;
+}
+
+sub walk_back_pid ( $start_pid, $check_pid, $check_exe, $check_hash, $check_name ) {
+  my $pid        = $start_pid;
+  my $hash_check = 1;
+  my $orig_exe   = $check_exe;
+  if ( $check_exe ) {
+    my($filename, $dirs, $suffix) = fileparse($check_exe);
+    $check_exe = $filename if $filename;
+    $hash_check = 0;
+  }
+  while ( $pid and  my $data = load_a_file("/proc/$pid/stat")  ) {
+    my @pid_stat = split(/ /, $data, 5);
+    return if @pid_stat < 5;
+    if ( $check_exe  and  $check_hash ) {
+      my $exe_hash;
+      my $exe      = load_a_file      ("/proc/$pid_stat[0]/cmdline");
+      my @exe_split= split(/\0/, $exe, 4) if $exe;
+      if ( @exe_split and $exe_split[1]=~m/$check_exe/ ) {
+        $> = 0;
+        if ( not -r $exe_split[1] ) { 
+          my $dir = readlink ("/proc/$pid/cwd");
+          $exe_split[1] = "$dir/$exe_split[1]" if $dir;
+          syslog ("gVault cannot read [$exe_split[1]] so I cannot determine if it changes. This is no good.") if  not -r $exe_split[1];
+        }
+        if ( -r $exe_split[1]  and  -f $exe_split[1] ) { 
+          $exe_hash = blake2b_256_file ( $exe_split[1] );
+          if ( defined $exe_hash ) {
+            if ( defined $exe_hash and $exe_hash eq $check_hash   and   $exe_split[2] eq $check_name ) {
+              #syslog ("Command MATCH [$exe_split[1]]  PID [$pid_stat[0]] and in PID tree of [$start_pid].");
+              $hash_check = 1;
+            }
+            else {
+              return _ERROR ("WARNING: [$exe_split[1]] could not be authenticated as the executable HASH check failed.") if ( defined $exe_hash and $exe_hash ne $check_hash );
+              return _ERROR ("[$exe_split[1]] could not be externally authenticated.  ARGUMENT authentication failed.")  if ( $exe_split[2] ne $check_name and not $check_name );
+              return _ERROR ("[$exe_split[1]] could not be externally authenticated.  ARGUMENT authentication failed.")  if ( $exe_split[2] ne $check_name );
+              return _ERROR ("[$exe_split[1]] could not be externally authenticated.  UNKNOWN!  Please report!!");
+            }
+          }
+        }
+        $> = $gv_u_id;
+      }
+    }
+    if ( ($pid_stat[3] == $check_pid) and $hash_check ) {
+      return 1;
+    }
+    $pid = $pid_stat[3]; 
+  }
+  return _ERROR ("Your command [$check_exe] was matched however the process was outside of the process tree [$check_pid] and therefore failed.") if $hash_check and $check_exe;
+  return;
+}
+
+
+
+sub auth_pid_check ($paranoia, $auth_type, $start_pid, $check_pid, $check_extra) {
+  # Walks back until we get the pid we want or not....
+  return _ERROR ("Cannot check a PID which is not numeric, this should not happen.")  if not looks_like_number($start_pid)  or  not looks_like_number($check_pid);
+  my $pid = $start_pid;
+  my $bkc = 0;
+  my $para = '';
+  while ( $pid and  my $data = load_a_file("/proc/$pid/stat")  ) {
+    my @pid_stat = split(/ /, $data, 5);
+    return if @pid_stat < 5;
+    $para .= " => [$pid_stat[1]] ";
+    if ( $paranoia ) {
+      $> = 0;
+      my $exe     = readlink ( "/proc/$pid/exe" );
+      $para .= " => [$exe] ";
+      if ( $para ne $exe ) {
+        my $cwd = readlink ("/proc/$pid/cwd");
+        if ( $pid_stat[1]=~m/^\((.*?)\)$/ ) {
+          $para .= "  =>[$cwd/$1] => [" . to_hex( blake2b_256_file ("$cwd/$1") ) . "]  " if -r "$cwd/$1";
+        }
+      }
+      $> = $gv_u_id;
+    }
+    if ( $pid_stat[3] == $check_pid ) {
+      return $para if not $check_extra  and  $auth_type eq 'AUTH';
+      # We do some more checks on this PID.. mainly we check the creation time which is kinda hard to fake on a recycled pid.
+      if ( $check_extra->{pid}  and  $check_extra->{start}  and  $check_extra->{pid} == $check_pid  and  my $pid_data = get_pid_data ( $check_extra->{pid} ) ) {
+        #syslog ("Authentication for [$start_pid] successful going back [$bkc] processes.") if $check_extra->{ppid} == $pid_data->{ppid}  and  $check_extra->{start} == $pid_data->{start};
+        return $para if $check_extra->{ppid} == $pid_data->{ppid}  and  $check_extra->{start} == $pid_data->{start};
+        my $h_pid = get_pid_data($start_pid);          
+        syslog ("AUTH_HACK. A likely hack attempt was made on the PID auth system from from UID [$h_pid->{uid}], PID [$start_pid], PPID [$h_pid->{ppid}], CMD [$h_pid->{cmd}].") if $h_pid and $h_pid->{cmd};
+        investigate ($start_pid);
+        investigate ($h_pid->{ppid});
+        syslog("The gVault is closing as a precaution.");
+        closedown();
+        return;
+      }
+    }
+    $bkc++;
+    $pid = $pid_stat[3]; ## very important you dick Mark, so don't delete it next time.
+  }
+  return;
+}
+
+sub get_pid_data  {
+  my $pid = $_[0];
+  if ( my $data = load_a_file("/proc/$pid/stat") ) {
+    my @pid_stat = split(/ /, $data, 23);
+    my $data;
+    if ( @pid_stat > 22 ) {
+      $data->{uid}   = load_a_file("/proc/$pid/loginuid");
+      $data->{cmd}   = load_a_file("/proc/$pid/cmdline");
+      $data->{pid}   = $pid_stat[0];
+      $data->{state} = $pid_stat[2];
+      $data->{ppid}  = $pid_stat[3];
+      $data->{tty}   = $pid_stat[6];
+      $data->{start} = $pid_stat[21];
+      return (keccak512( from_hex('ff6c0578f1a26bb0316d15c937610772bba99680b8f5e85d6aa6ebe5') . 
+         blake2b_256($pid_stat[0]).  
+         blake2b_256($pid_stat[1]).  
+         blake2b_256($pid_stat[3]).  
+         blake2b_256($pid_stat[4]).  
+         blake2b_256($pid_stat[5]).  
+         blake2b_256($pid_stat[6]).  
+         blake2b_256($pid_stat[7]).  
+         blake2b_256($pid_stat[17]).  
+         blake2b_256($pid_stat[18]).  
+         blake2b_256($pid_stat[19]).  
+         blake2b_256($pid_stat[21]) ), $data);
+    }
+  }
+  return;
+}
+
+
+sub session_enc {
+  return if not defined $_[0];
+  # encrypts a session variable using the encrypted session variable
+  try {
+    return $g_two->encrypt ( $_[0], _session_dec($session_secret->{secret}), _session_dec($session_secret->{iv}) );
+  }
+  catch {
+    return;
+  }
+}
+
+sub session_dec {
+  # decrypts a session variable using the encrypted session variable
+  return if not defined $_[0];
+  try {
+    return $g_two->decrypt ( $_[0], _session_dec($session_secret->{secret}), _session_dec($session_secret->{iv}) );
+  }
+  catch {
+    _ERROR ("Failes session dec with [$_[0]]");
+    return;
+  }
+}
+
+sub _session_dec {
+  $g_two->decrypt ( $_[0], $_session_secret->{secret}, $_session_secret->{iv} )
+}
+
+sub _session_enc {
+  return if not defined $_[0];
+  $g_two->encrypt ( $_[0], $_session_secret->{secret}, $_session_secret->{iv} )
+}
+
+sub dec_data ($data, $pid, $hash) {
+  return if not $data or not $pid;
+  # A simple level encryption between UNIX sockets based around the connecting PID and it's underlying data.
+  my ($d, $p)    = get_pid_data($pid);
+  $d = keccak512  ( $d . $hash );
+  #_ERROR  ("Incoming data was single session encrypted only.") if not $hash;
+
+  my $secret = substr ($d,  9, 32);
+  my $iv     = substr ($d, 47, 16);
+  try {
+    return $g_two->decrypt ( from_hex($data), $secret, $iv );
+  }
+  catch {
+    investigate($pid);
+    return _ERROR ("gVault decrypt data failed which should never happen.");
+  }
+  return;
+}
+
+sub investigate ($pid) {
+  return _ERROR ("gVault recommends you investigate your system, this process [$pid] in particular.");
+}
+
+sub enc_two {
+  try {
+    my $encrypted  = $g_two->encrypt ( (random_bytes(16) . $_[0]), _session_dec($session_secret->{two}), _session_dec($session_secret->{iv2}) );
+    return blake2b ( 16,  _session_dec($session_secret->{hmac}), $encrypted ) . $encrypted; 
+  }
+  catch  {
+  }
+}
+
+sub dec_two {
+  my $h = blake2b( 16, _session_dec($session_secret->{hmac}), substr($_[0], 16) );
+  return _ERROR ("HMAC check failure." ) if $h ne substr($_[0],0,16); ##HMAC
+  return substr( $g_two->decrypt ( substr($_[0], 16), _session_dec($session_secret->{two}), _session_dec($session_secret->{iv2})) , 16);
+}
+
+
+sub make_session {
+  $_session_secret->{secret} = random_bytes(32);
+  $_session_secret->{iv}     = random_bytes(16);
+  $session_secret ->{secret} = _session_enc(random_bytes(32));
+  $session_secret ->{iv}     = _session_enc(random_bytes(16));
+  $session_secret ->{hmac}   = _session_enc(random_bytes(32));
+  $session_secret ->{two}    = _session_enc(random_bytes(32));
+  $session_secret ->{iv2}    = _session_enc(random_bytes(16));
+  $session_secret ->{global} = session_enc( get_g_vault_passwd() );
+}
+
+sub _ERROR {
+  syslog ($_[0]);
+  return;
+}
+
+
+sub to_hex {
+  return unpack("H*",  $_[0]) if $_[0];
+  return;
+}
+
+sub from_hex {
+  return pack 'H*', $_[0] if $_[0];
+  return;
+}
+
+
+sub syslog {
+  my $info = $_[0];
+  return if not $info;
+  chomp $info;
+  print STDERR $info . "\n";
+  #$syslog->print ($info . "\n");
+  return 1;
+}
+
+sub inode {
+  my (undef,$ino) = stat($SOCK_PATH);
+  return $ino if $ino;
+  return 0;
+}
+
+sub check_sock_path {
+  if ( -e $SOCK_PATH ) {
+    if ( -e $SOCK_PATH . ".old" ) {
+      syslog("gVault is deleting [$SOCK_PATH.old].");
+      unlink $SOCK_PATH . ".old" or return;
+    }
+    syslog("gVault is renaming [$SOCK_PATH] to [$SOCK_PATH.old].");
+    rename $SOCK_PATH, $SOCK_PATH . ".old" or return; 
+  }
+  if ( -e $SOCK_PATH ) {
+    syslog("gVault cannot start as the [$SOCK_PATH] already exists.");
+    sd_notify(stopping => 1, status => "gVault cannot start as the [$SOCK_PATH] already exists.");
+    return;
+  }
+  return 1;
+}
+
+sub remove_unix_socket ($key) {
+  if ( $conn_tracker->{$key} ) {
+    my $handle = $sel->exists (  $conn_tracker->{$key}->{handle} );
+    if ( $handle ) {
+      try {
+        $sel->remove($handle);
+        $handle->close;
+        ###syslog( "Closed connection from PID [$conn_tracker->{$key}->{pid}].\n");
+      }
+      catch {
+      }
+      $conn_count--;
+      delete $conn_tracker->{$key};
+      return 1;
+    }
+  }
+  return;
+}
+
+sub load_a_file ($file_name) {
+  # loads upto 512 bytes from a $file_name
+  if ( -r $file_name ) {
+    if ( open (my $fh, '<', $file_name) ) {
+      if ( my $read_ok  = sysread ( $fh, my $data, 2048 ) ) {
+        return $data if defined $data;
+        syslog( "The file [$file_name] returned no data.");
+        return;
+      }
+    }
+    else {
+      syslog( "The file [$file_name] could not be loaded." );
+    }
+  }
+  else {
+    syslog( "The file [$file_name] could not be read." );
+  }
+  return;
+}
+
+sub handle_signal {
+    my $signal = $_[0];
+    if ( $signal eq 'HUP' ) {
+      # We just pretend to reload.
+      syslog("gVault is reloading the configuration with a [$signal] signal.");
+      sd_notify(reloading => 1, status => 'Reloading configuration...');
+      sd_notify(ready => 1, status => 'gVault is ready.');
+    }
+    elsif ( $signal eq 'TERM' or  $signal eq 'INT' ) {
+      syslog ("gVault was told to close with a [$signal] signal.");
+      closedown();
+    }
+    elsif ( $signal eq 'PIPE' ) {
+      syslog("gVault UNIX SOCKET client was unfriendly, really this should not happen. Anyway, I am ignoring it.");
+    }
+    else {
+      syslog("gVault doesn't know what to do with a [$signal] so I am ignoring it.");
+    }
+}

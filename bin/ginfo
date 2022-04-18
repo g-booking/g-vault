@@ -1,0 +1,68 @@
+#!/usr/local/_gvault/bin/perl
+use v5.20;
+use strict;
+use warnings;
+require "/usr/local/_gvault/lib/gVault.pm";
+
+#use gVault qw ( gvault  gencrypt  gdecrypt  to_hex  ghash_256  ghash_512 );
+
+### so here is simple... we read a file in chunks.... and we encrypt each.. with it's own HMAC, with it's own CRYPT.... 
+
+my $read_ok    = -1;
+my $stdin_fh   = *STDIN;
+my $vault_name;
+$vault_name = $ENV{_gvde_} if  $ENV{_gvde_};
+$vault_name = $ARGV[0]     if  $ARGV[0];
+die "Usage $0 <name_of_vault__or__vault_location>\n" if not $vault_name;
+
+my $chunk      = 0;
+
+gVault::gvault ( $vault_name ) or die "I could not load the master vault for that.\n";
+$vault_name = gVault::get_vault_name($vault_name);
+
+
+## No buffering...
+$| = 1;
+
+while ( $read_ok != 0 ) {
+  ## Header...
+  my $header_data = '';
+  while ( length($header_data) != 4 and $read_ok != 0) {
+    $read_ok  = sysread ( $stdin_fh, my $data, 4 - length($header_data) );
+    $header_data .= $data;
+  }
+  if ( length( $header_data ) == 4  ) {
+    ## that's our length header in simple hex.
+    ## very converluted.. clearly join and split can be done in 1 but I tried now for 10 minutes and failed so fuck it... so done some crazy shit man.
+    ## now we read in the entire block and then decypt it...
+    ## we might have to go around and around here to make sure we got all the data...
+    my $length_header = hex( ( join '', split '', unpack 'H*', $header_data  ) );  # crazy!
+    my $data = ''; ## ? good?? dunno
+    while ( length($data) != $length_header ) {
+      if ( $read_ok  = sysread ( $stdin_fh, my $tdata, ($length_header - length($data)) ) ) {
+        $data .= $tdata;
+      }
+      else {
+        die "WARNING: I got a [0] byte read and I expected some result.\n"; # if $read_ok == 0; ## ??? not sure, shouldn't happen but it could i guess if file is messed about with
+      }
+    }
+
+    $chunk++;
+    my ($algo, $rounds) = gVault::algo_info($vault_name, substr($data,0,1));
+    print STDERR "[$chunk]  gVault [$vault_name] using MASTER [" . ord(substr($data,0,1)) . "] / 255 using [$algo] algorithm, [$rounds] rounds @ 384 bits of entropy.\n" if $chunk == 1;
+    print STDERR "[$chunk]  gVault [$vault_name] uses dual-HKDF + a unique key [$algo] algorithm, [$rounds] rounds @ 384 bits of entropy.\n" if $chunk != 1;
+    print STDOUT $header_data . $data;
+  }
+  elsif ( $read_ok == 0  and  length($header_data) == 0 )   {
+    ## that looks like success..
+    last;
+  }
+  elsif ( $read_ok == 0 )   {
+    # something messed up here... let's harakiri... we only have part of a header and we have a 0 read.. 
+    die "Encrypted file is likely corrupt.. or I messed something up\n"; 
+  }
+  else {
+    ## no idea at all.
+    die "Encrypted file is likely corrupt.. or no ideas really.\n";
+  }
+}

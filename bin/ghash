@@ -1,0 +1,44 @@
+#!/usr/local/_gvault/bin/perl
+use v5.20;
+use strict;
+use warnings;
+
+require "/usr/local/_gvault/lib/gVault.pm";
+
+my $stdin_fh   = *STDIN;
+my $vault_name;
+$vault_name = $ENV{_gvde_} if  $ENV{_gvde_};
+$vault_name = $ARGV[0]     if  $ARGV[0];
+die "Usage $0 <name_of_vault__or__vault_location>\n" if not $vault_name;
+
+gVault::gvault ( $vault_name ) or die "I could not load the master vault for that.\n";
+$vault_name = gVault::get_vault_name($vault_name);
+
+### so here is so so simple... we read a file in chunks.... and we encrypt each...with gvault.
+### I read about IOSELECT but dunno... not using it here... but maybe this can do something for me... for now, this is just mr. simple and that works.
+
+my $read_ok     = -1;
+my $max_bytes   = 3145728 ; # 3MB chunks?
+my $chunk       = 0;
+my $total_bytes = 0;
+my $encry_bytes = 0;
+my $next_s      = '';
+
+## No buffering...
+$| = 1;
+
+my $data;
+my $hash = '';
+while ( $read_ok  = sysread ( $stdin_fh, my $read_data,  $max_bytes ) != 0 ) {
+  $data .= $read_data;
+  if ( length($data) >= $max_bytes ) {
+    $hash .= gVault::ghash_256 ($vault_name, substr($data,0,$max_bytes)) . " | ";
+    $data = substr($data, $max_bytes);
+  }
+}
+$hash .= gVault::ghash_256 ($vault_name, $data) if defined $data and length($data)>0;
+
+print STDOUT gVault::to_hex( gVault::blake2s_128($hash) ) . "\n" if $ARGV[1]  and $ARGV[1] == 128;
+print STDOUT gVault::to_hex( gVault::blake2b_256($hash) ) . "\n" if $ARGV[1]  and $ARGV[1] == 256;
+print STDOUT gVault::to_hex( gVault::blake2b_512($hash) ) . "\n" if $ARGV[1]  and $ARGV[1] == 512;
+print STDOUT gVault::to_hex( gVault::blake2b_512($hash) ) . "\n" if not $ARGV[1];

@@ -3,6 +3,17 @@
 ####     works for RedHat / Debian / Ubuntu at least for latest tested versions   ########
 ###                it is not tricky dicky so you can adapt if you need....        ####
 
+if [[ ! -f './bin/gvault' ]]
+then
+    echo "
+
+This script is not supposed to be run directly... please use
+        curl -L https://raw.githubusercontent.com/g-booking/g-vault/main/gvault_install-0.90.sh | bash
+ to install or have the key files available in ./bin ./sys ./lib and then re-run this script. 
+"
+
+  exit 1
+fi
 
 # We need to compile basic stuff so make sure you have a compilier and can make stuff... 
 # for REDHAT / CENTOS, something like this:       (otherwise please adjust for your system).
@@ -123,14 +134,14 @@ files go here... direct from Certbot or another registrar.
    mv -f ./sys/*     /usr/local/_gvault/sys        >>~/g_vault_install.log 2>>~/g_vault_install.err
    mv -f ./lib/*     /usr/local/_gvault/lib        >>~/g_vault_install.log 2>>~/g_vault_install.err
 
-   ln /usr/local/_gvault/bin/gencrypt      /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
-   ln /usr/local/_gvault/bin/gdecrypt      /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
-   ln /usr/local/_gvault/bin/ginfo         /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
-   ln /usr/local/_gvault/bin/gvault        /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
-   ln /usr/local/_gvault/bin/ghash         /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
-   ln /usr/local/_gvault/bin/g_vault_send  /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
-   ln -s /usr/bin/perl                     /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
-   ln -s /usr/local/bin/perl               /usr/local/_gvault/bin   >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f /usr/local/_gvault/bin/gencrypt      /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f /usr/local/_gvault/bin/gdecrypt      /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f /usr/local/_gvault/bin/ginfo         /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f /usr/local/_gvault/bin/gvault        /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f /usr/local/_gvault/bin/ghash         /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f /usr/local/_gvault/bin/g_vault_send  /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f -s /usr/bin/perl                     /usr/local/bin           >>~/g_vault_install.log 2>>~/g_vault_install.err
+   ln -f -s /usr/local/bin/perl               /usr/local/_gvault/bin   >>~/g_vault_install.log 2>>~/g_vault_install.err
 
    chcon --reference=/usr/bin/perl         /usr/local/_gvault/sys/gvaultd  >>~/g_vault_install.log 2>>~/g_vault_install.err
    rm -f /usr/local/_gvault/sys/cat
@@ -178,6 +189,13 @@ files go here... direct from Certbot or another registrar.
    chattr +i /usr/local/_gvault/bin/g*   >>~/g_vault_install.log 2>>~/g_vault_install.err
    chattr +i /usr/local/_gvault/lib/g*   >>~/g_vault_install.log 2>>~/g_vault_install.err
    chattr +i /usr/local/_gvault/sys/*    >>~/g_vault_install.log 2>>~/g_vault_install.err
+
+   chattr +i /usr/local/bin/gencrypt     >>~/g_vault_install.log 2>>~/g_vault_install.err
+   chattr +i /usr/local/bin/gdecrypt     >>~/g_vault_install.log 2>>~/g_vault_install.err
+   chattr +i /usr/local/bin/ginfo        >>~/g_vault_install.log 2>>~/g_vault_install.err
+   chattr +i /usr/local/bin/gvault       >>~/g_vault_install.log 2>>~/g_vault_install.err
+   chattr +i /usr/local/bin/ghash        >>~/g_vault_install.log 2>>~/g_vault_install.err
+   chattr +i /usr/local/bin/g_vault_send >>~/g_vault_install.log 2>>~/g_vault_install.err
 
    systemctl status gvault 2>/dev/null 
 

@@ -418,24 +418,30 @@ sub make_g_vault ($secret_name, $secret_file) {
  #export   _gv_=`~/.gv.sh $$`          # NOT IN PARANOID MODE
 
  # gVault, check if authorisation succeded or not... if using gVault daemon that is...
- if [ -z "$_gv_" ]
-   then
-      echo "gVault FAILED authentication."
-   else
-      echo "gVault is authenticated."
- fi
+
+case $- in *i*)
+
+   if [ -z "$_gv_" ]
+     then
+        echo "gVault FAILED authentication."
+     else
+        echo "gVault is authenticated."
+   fi
+esac
 
  # master secrets here #
 
 
 
  # and we check here #
- for gvault in `ls ~/.*.gvault 2>/dev/null`
- do
-   if [ -f "$gvault" ]; then
-     gvault -v "$gvault"
-   fi
- done
+case $- in *i*)
+   for gvault in `ls ~/.*.gvault 2>/dev/null`
+   do
+     if [ -f "$gvault" ]; then
+       gvault -v "$gvault"
+     fi
+   done
+esac
 
 ###### gVault ~/.bashrc FINISH ########
 

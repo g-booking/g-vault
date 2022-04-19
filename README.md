@@ -3,9 +3,9 @@ g-Vault allows seamless secure access to any recognised system such as Postgres,
 be leveraging within your infrastructure. In-addition, it seamlessly secures any sensitive data such as backups, files or documents.
 
 There are commercial systems that say they do this, however g-Vault will deliver you an unparalleled level of security whilst being
-easy to set-up, easy to slot into your existing system and is seamlessly integrated and self-contained. It might not be perfect but
-it will improve your security and it can improve it in less than 60 seconds once installed as opposed to commercial systems which 
-might takes weeks to understand and months to implement.
+easy to set-up, easy to slot into your existing system and is seamlessly integrated and self-contained. g-Vault is very simple and 
+will improve your security in less than 60 seconds once installed as opposed to commercial systems which may take weeks to understand
+and months to implement.
 
 g-Vault starts from the premise that the bad actor has already:
 

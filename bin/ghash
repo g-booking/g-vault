@@ -3,7 +3,8 @@ use v5.20;
 use strict;
 use warnings;
 
-require "/usr/local/_gvault/lib/gVault.pm";
+use gVault;
+#require "/usr/local/_gvault/lib/gVault.pm";
 
 my $stdin_fh   = *STDIN;
 my $vault_name;

@@ -1,7 +1,7 @@
 package gVault;
 use warnings;
-use feature                    qw( signatures               );
-no  warnings                   qw( experimental::signatures );
+use feature                    qw( signatures  );
+no warnings  'experimental';
 use Exporter;
 use Syntax::Keyword::Try;
 use Crypt::Mode::CBC;
@@ -19,15 +19,16 @@ use Scalar::Util               qw( looks_like_number            );
 use File::Basename;
 use IO::Socket::UNIX;
 use Cwd qw (realpath);
+use Data::Dump qw (dump);
 
 ##use Carp qw (cluck);
+#require "/gbooking/g-booking-server/test/gcrypt/gPassword.pm";
+  
 use constant {
              GVAULT_FILE_SIZE   => 97360,
              GVAULT_CONF_SIZE   =>  1776,
              VERSION            => '0.90',
 };
-#require "/gbooking/g-booking-server/test/gcrypt/gPassword.pm";
-  
     
 my $MARK = 0;
 my $SOCK_PATH = "/usr/local/_gvault/sock/.gvault.sock";
@@ -392,12 +393,13 @@ sub session_enc {
 }
  
 sub gdecrypt {
-  my $secret;
-  my $who    = $_[0];
-  my $what   = $_[1];
-     $secret = $_[2] if $_[2];
-  return if not defined $what;
+  my ( $secret, $what );
+  return if not defined $_[0] or not defined $_[1];
+  my $who = $_[0];
+  $what   = $_[1];
+  $secret = $_[2] if $_[2];
   my $algo   = ord(substr($what,0,1));
+
   if ( (not $secret)  and  ($actual_secrets->{$who}  ) ) {
     $secret = $actual_secrets->{$who}->{$algo};
   }
@@ -424,11 +426,11 @@ sub gdecrypt {
 }
 
 sub gencrypt {
-  my $secret;
-  my $who    = $_[0];
-  return if not $who;
-  my $what   = $_[1];
-     $secret = $_[2] if $_[2];
+  my ( $secret, $what );
+  return if not defined $_[0] or not defined $_[1];
+  my $who = $_[0];
+  $what   = $_[1];
+  $secret = $_[2] if $_[2];
   my $algo;
   if ( (not $secret)  and ($actual_secrets->{$who}  ) ) {
     $algo   = ord(random_bytes(1)); ## no need to orderly rotate... 

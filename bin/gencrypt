@@ -1,10 +1,16 @@
 #!/usr/local/_gvault/bin/perl
 use v5.20;
 use strict;
+use common::sense;
+use feature qw(signatures);
 use warnings;
-use Scalar::Util qw( looks_like_number );
+use experimental qw( switch );
+no warnings qw(experimental::signatures);
 
-require "/usr/local/_gvault/lib/gVault.pm";
+use Scalar::Util qw( looks_like_number );
+use Compress::Zlib;
+use gVault;
+#require "/usr/local/_gvault/lib/gVault.pm";
 
 ## No buffering...??? probably for the best, dunno really.
 $| = 1;
@@ -20,24 +26,34 @@ $vault_name = gVault::get_vault_name($vault_name);
 ### so here is so so simple... we read a file in chunks.... and we encrypt each...with gvault.
 ### I read about IOSELECT but dunno... not using it here... but maybe this can do something for me... for now, this is just mr. simple and that works.
 
-my ( $total_bytes, $encry_bytes, $chunks, $read ) = 0;
+my ( $encrypt, $total_bytes, $encry_bytes, $chunks, $read ) = 0;
+$chunks         = $encry_bytes = $encrypt = 0;
 my $next_s      = '';
 my $tty         = 1;
 my $fh          = *STDIN;
-my $buffer_size = 10 * 1024 * 1000;
+my $buffer_size = 10 * 1024 * 1000;  #10MB seems a good default... but you can override with 2nd ARGV as maybe you want every KB?
 
 if ( $ARGV[1] and looks_like_number($ARGV[1]) and $ARGV[1] > 1 ) {
   $buffer_size = $ARGV[1];
-  $buffer_size = 4200000000 if $buffer_size > 4200000000;
+  $buffer_size = 1000000000 if $buffer_size > 1000000000;
   print STDERR "Set a custom input buffer size of [$buffer_size].\n";
 }
+
+if ( $ARGV[2] and looks_like_number($ARGV[2]) and $ARGV[2] > 1 ) {
+  $buffer_size = $ARGV[2];
+  $buffer_size = 1000000000 if $buffer_size > 1000000000;
+  print STDERR "Set a custom input buffer size of [$buffer_size].\n";
+}
+$encrypt = 1 if $ARGV[1] and $ARGV[1] eq '-e';
+$encrypt = 1 if $ARGV[2] and $ARGV[2] eq '-e';
 
 undef $tty if ( -t *STDOUT ); ## tty, just output it
 
 ## How simple is this... :)  love that.
 do {
     $read   = read $fh, (my $buf), $buffer_size;
-    encrypt(\$buf) if $read;
+    encrypt(\$buf)               if $read and not $encrypt;
+    encrypt(\compress(\$buf, 3)) if $read and $encrypt;
 } while ($read);
 
 print STDERR "\n" if not $tty;
@@ -46,13 +62,21 @@ print STDERR "Encrypted [$total_bytes] bytes in [$chunks] chunks with an overhea
 
 sub encrypt  {
   my $data = ${$_[0]};
+  #my $data = $_[0];
+  ##if ( not $encrypt ) {
+  #  $data = ${$_[0]};
+  #}
+  #else {
+  #  # Encrypting...
+  #  $data = compress( ${$_[0]}, 4 );
+  #}
   $chunks++;
   $total_bytes += length($data);
   ($next_s, $data) = gVault::gencrypt( $vault_name, $data, $next_s ) or die "I need a doctor.\n"; # use same var? saves memory?
-  $encry_bytes += 4 + length($data);                                                      # 4 byte length header
+  $encry_bytes += 5 + length($data);                                                      # 4 byte length header
   my $length_h  = join( '', split '', pack 'H*', sprintf( '%08x', length($data) ) );      # re-look at when you are sober.
-  print STDOUT        $length_h . $data   if     $tty;
-  print STDOUT to_hex($length_h . $data)  if not $tty;
+  print STDOUT        $encrypt . $length_h . $data   if     $tty;
+  print STDOUT to_hex($encrypt . $length_h . $data)  if not $tty;
 }
 
 sub to_hex {

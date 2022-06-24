@@ -1,9 +1,9 @@
 #!/usr/local/_gvault/bin/perl
-
-use v5.20;
+use 5.02;
+#use lib '/usr/local/_gvault/lib';
 use warnings;
 use feature  qw(signatures);
-no  warnings qw(experimental::signatures);
+no warnings  'experimental';
 use IO::Socket::UNIX;
 use Crypt::Mode::CBC;
 use Scalar::Util               qw( looks_like_number );
@@ -15,9 +15,8 @@ use Storable                   qw( freeze thaw       );
 use Data::Dump                 qw( dump              );
 use MIME::Base64               qw( decode_base64 encode_base64     );
 use File::Basename;
- 
+use gVault; 
 use Cwd qw (abs_path realpath);
-require "/usr/local/_gvault/lib/gVault.pm";
 use constant VERSION => '0.90';
 my $secret_file   = '';
 my $secret_suffix = 'gvault';
@@ -412,11 +411,12 @@ sub make_g_vault ($secret_name, $secret_file) {
 ' . decode_base64('ICAgICAgICAgICAgICBfXyAgICAgIF9fICAgICAgICAgICAgXyAgXyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgXCBcICAgIC8gLyAgICAgICAgICAgfCB8fCB8ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICBfXyBfICBfX19fX19cIFwgIC8gL19fIF8gIF8gICBfIHwgfHwgfF8gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAvIF9gIHx8X19fX19ffFwgXC8gLy8gX2AgfHwgfCB8IHx8IHx8IF9ffCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiB8IChffCB8ICBfX19fXyAgXCAgL3wgKF98IHx8IHxffCB8fCB8fCB8XyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogIFxfXywgfCAvIF9fX198ICBcLyAgXF9fLF98IFxfXyxffHxffCBcX198ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgX18vIHx8IChfX18gICAgX19fICAgX19fICBfICAgXyAgXyBfXyAgX19fICAgXyAgIF8gICBfX18gICBfICAgXyAgXyBfXyAgCiAgfF9fXy8gIFxfX18gXCAgLyBfIFwgLyBfX3x8IHwgfCB8fCAnX198LyBfIFwgfCB8IHwgfCAvIF8gXCB8IHwgfCB8fCAnX198IAogICAgICAgICBfX19fKSB8fCAgX18vfCAoX18gfCB8X3wgfHwgfCAgfCAgX18vIHwgfF98IHx8IChfKSB8fCB8X3wgfHwgfCAgICAKICAgICAgICB8X19fX18vICBcX19ffCBcX19ffCBcX18sX3x8X3wgICBcX19ffCAgXF9fLCB8IFxfX18vICBcX18sX3x8X3wgICAgCiAgICAgICAgICAgICAgICAgICAgIF8gICAgICAgICAgICAgICAgICAgICAgICAgICBfXy8gfCAgICAgICAgICAgICBfICAgICAgIAogICAgICAgICAgICAgICAgICAgIChfKSAgICAgICAgICAgICAgICAgICAgICAgICB8X19fLyAgICAgICAgICAgICB8IHwgICAgICAKICAgX19fICBfIF9fIF9fICAgX18gXyAgXyBfXyAgX19fICAgXyBfXyAgIF8gX18gX19fICAgIF9fXyAgXyBfXyAgfCB8XyAgICAgCiAgLyBfIFx8ICdfIFxcIFwgLyAvfCB8fCAnX198LyBfIFwgfCAnXyBcIHwgJ18gYCBfIFwgIC8gXyBcfCAnXyBcIHwgX198ICAgIAogfCAgX18vfCB8IHwgfFwgViAvIHwgfHwgfCAgfCAoXykgfHwgfCB8IHx8IHwgfCB8IHwgfHwgIF9fL3wgfCB8IHx8IHxfICAgICAKICBcX19ffHxffCB8X3wgXF8vICB8X3x8X3wgICBcX19fLyB8X3wgfF98fF98IHxffCB8X3wgXF9fX3x8X3wgfF98IFxfX3wgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAo=') );
   _INFO ('
 ###### gVault ~/.bashrc START ########
+ export PERL5LIB=$PERL5LIB:/usr/local/_gvault/lib
  export _gvid_=' . $gvid . '
  export _gvss_=`/usr/local/bin/gvault -s`
  GVSH=`/usr/local/_gvault/sys/cat ~/.gv.sh | /usr/local/_gvault/sys/sha512sum`
- export   _gv_=`~/.gv.sh $$ 1 $GVSH`   # PARANOID MODE
- #export   _gv_=`~/.gv.sh $$`          # NOT IN PARANOID MODE
+ #export   _gv_=`~/.gv.sh $$ 1 $GVSH`   # PARANOID MODE
+ export   _gv_=`~/.gv.sh $$`          # NOT IN PARANOID MODE
 
  # gVault, check if authorisation succeded or not... if using gVault daemon that is...
 
@@ -492,10 +492,10 @@ sub make_the_pepper {
   ### so there is no configuration file in /etc/  or   ~/etc/
   # if we can write to /etc/ then we put the file there otherwise we use the home directory....
   $full_path = '/etc/gVault.conf';
-  if (    check_write ( '/etc/gVault.conf' ) ) {
+  if ( not -e '/etc/gVault.conf'  and  check_write ( '/etc/gVault.conf' ) ) {
     $full_path = '/etc/gVault.conf';
   }
-  elsif ( check_write ( $ENV{HOME} . '/etc/gVault.conf' ) ) {
+  elsif ( not -e $ENV{HOME} . '/etc/gVault.conf'  and  check_write ( $ENV{HOME} . '/etc/gVault.conf' ) ) {
     $full_path = $ENV{HOME} . '/etc/gVault.conf';
   }
   else {
@@ -1019,6 +1019,7 @@ fi
 
 
  FIXED_DISKS=
+ETHERNET_MAC=
 CHECK_IP_INT=
 CHECK_IP_EXT=
 CHECK_MY_ISP=
@@ -1026,21 +1027,26 @@ KEYBOARD_ENT=
 EXTERNAL_SSL=
  YOUR_CUSTOM=
 
+if [ -n "$ETHERNET_MAC" ]; then
+  # Do not use this with VIRTUAL SERVER PROVIDERS!
+  E_MAC=`ip link | sort | grep link | sort | /usr/local/_gvault/sys/md5sum`
+fi
+
 if [ -n "$FIXED_DISKS" ]; then
-  DISKS=`lsblk | sort | md5sum`
+  DISKS=`lsblk | sort | /usr/local/_gvault/sys/md5sum`
 fi
 
 if [ -n "$CHECK_IP_EXT" ]; then
-  MY_IP_EXT=`curl -s https://api64.ipify.org`
+  MY_IP_EXT=`curl -s https://api64.ipify.org | sort | /usr/local/_gvault/sys/md5sum`
 fi
 
 if [ -n "$CHECK_IP_INT" ]; then
-  MY_IP_INT=`/usr/sbin/ifconfig | grep inet`
+  MY_IP_INT=`/usr/sbin/ifconfig | grep inet | sort | /usr/local/_gvault/sys/md5sum`
 fi
 
 if [ -n "$CHECK_MY_ISP" ]; then
-  ISP_IP=`curl -s https://api64.ipify.org`
-  MY_ISP=`curl -s https://api.iplocation.net/?ip=$ISP_IP | json_pp | grep isp`
+  ISP_IP=`curl -s https://api64.ipify.org | sort | /usr/local/_gvault/sys/md5sum`
+  MY_ISP=`curl -s https://api.iplocation.net/?ip=$ISP_IP | json_pp | grep isp | sort | /usr/local/_gvault/sys/md5sum`
 fi
 
 if [ -n "$PARANOID" ]; then
@@ -1070,7 +1076,7 @@ fi
 # gVault utilises PID authentication in-addition to everything else so we want to authorise the calling PID, not the PID of this script!
 # and send the data back to the main calling script.
 
-_gv_inter="${DISKS} ${MY_IP_INT} ${MY_IP_EXT} ${MY_ISP} ${SHA_5SUM} ${MD5_SUM} ${GV_SEND} ${GV_VAULT} ${CAT_SUM} ${KEYBOARD} ${SSL} ${CUSTOM} ${G_USER_VAULT} ${G_VAULT} ${G_HASH} ${PARANOID} ANDROID!"
+_gv_inter="${E_MAC} ${DISKS} ${MY_IP_INT} ${MY_IP_EXT} ${MY_ISP} ${SHA_5SUM} ${MD5_SUM} ${GV_SEND} ${GV_VAULT} ${CAT_SUM} ${KEYBOARD} ${SSL} ${CUSTOM} ${G_USER_VAULT} ${G_VAULT} ${G_HASH} ${PARANOID} ANDROID!"
   _gv_sha=`echo $_gv_inter | /usr/local/_gvault/sys/sha512sum`
  _gv_auth=`echo AUTH gvid=$_gvid_ pid=$1 data=$_gv_sha v=$VERSION para=$PARANOID | /usr/local/_gvault/bin/g_vault_send`
 echo $_gv_auth';

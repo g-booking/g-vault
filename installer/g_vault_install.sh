@@ -90,6 +90,17 @@ echo "                    (_)                         |___/             | |"
   ~/g_cpm.exe install -g  IO::Handle::Record  IO::Socket::Timeout  >>~/g_vault_install.log      2>>~/g_vault_install.err
 
 echo '   ___  _ __ __   __ _  _ __  ___   _ __   _ __ ___    ___  _ __  | |_'
+
+
+#     2016 Linux::Systemd
+#     2013 IO::Socket::Timeout
+#     2005 IO::Handle::Record
+#     2016 Syntax::Keyword::Try
+#     2013 Crypt::Mode::CBC
+#     2011 Crypt::PRNG
+#     2016 Crypt::Argon2
+#     2010 HTTP::Tiny
+
 # ==>  Here are the optional modules we use:
 #  ==> These are used for the supporting packages in sys <==
 #      ==> (all known and respectable) <==

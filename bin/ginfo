@@ -4,6 +4,7 @@ use strict;
 use warnings;
 require "/usr/local/_gvault/lib/gVault.pm";
 
+
 #use gVault qw ( gvault  gencrypt  gdecrypt  to_hex  ghash_256  ghash_512 );
 
 ### so here is simple... we read a file in chunks.... and we encrypt each.. with it's own HMAC, with it's own CRYPT.... 
@@ -23,6 +24,7 @@ $vault_name = gVault::get_vault_name($vault_name);
 
 ## No buffering...
 $| = 1;
+my $total_bytes = 0;
 
 while ( $read_ok != 0 ) {
   ## Header...
@@ -40,6 +42,7 @@ while ( $read_ok != 0 ) {
     my $data = ''; ## ? good?? dunno
     while ( length($data) != $length_header ) {
       if ( $read_ok  = sysread ( $stdin_fh, my $tdata, ($length_header - length($data)) ) ) {
+        
         $data .= $tdata;
       }
       else {
@@ -49,8 +52,8 @@ while ( $read_ok != 0 ) {
 
     $chunk++;
     my ($algo, $rounds) = gVault::algo_info($vault_name, substr($data,0,1));
-    print STDERR "[$chunk]  gVault [$vault_name] using MASTER [" . ord(substr($data,0,1)) . "] / 255 using [$algo] algorithm, [$rounds] rounds @ 384 bits of entropy.\n" if $chunk == 1;
-    print STDERR "[$chunk]  gVault [$vault_name] uses dual-HKDF + a unique key [$algo] algorithm, [$rounds] rounds @ 384 bits of entropy.\n" if $chunk != 1;
+    print STDERR "[$chunk]  gVault [$vault_name] using MASTER [" . ord(substr($data,0,1)) . "] / 255 using [$algo] algo @[$rounds] rounds. [$length_header] bytes.\n" if $chunk == 1;
+    print STDERR "[$chunk]  gVault [$vault_name] uses dual-HKDF + a unique key [$algo] algo @[$rounds] rounds. [$length_header] bytes.\n" if $chunk != 1;
     print STDOUT $header_data . $data;
   }
   elsif ( $read_ok == 0  and  length($header_data) == 0 )   {

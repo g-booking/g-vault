@@ -1,0 +1,21 @@
+#!/usr/local/_gvault/bin/perl
+use v5.20;
+use strict;
+use common::sense;
+use feature qw(signatures);
+use warnings;
+use experimental qw( switch );
+no warnings qw(experimental::signatures);
+use gVault;
+$| = 1;
+
+my $vault = $ARGV[0] or die "I need a vault name. \n$0 [g_vault_name] [some_data]\n";
+my $data  = $ARGV[1] or die "I need some streaming data. \n$0 [g_vault_name] [some_data]\n";
+
+gVault::gload($vault) or die "I could not load the vault\n";
+
+my $enc = ( gVault::gencrypt($vault,$data) );
+
+print unpack( "H*", $enc ) . "\n";
+
+

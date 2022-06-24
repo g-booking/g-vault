@@ -3,7 +3,10 @@
 use v5.20;
 use strict;
 use warnings;
-require "/usr/local/_gvault/lib/gVault.pm";
+#use Compress::LZ4;
+use Compress::Zlib;
+use gVault;
+#require "/usr/local/_gvault/lib/gVault.pm";
 
 ##use gVault qw ( gvault gdecrypt get_vault_name);
 ## No buffering...
@@ -25,16 +28,17 @@ $vault_name    = gVault::get_vault_name($vault_name);
 while ( $read_ok != 0 ) {
   ## Header...
   my $header_data = '';
-  while ( length($header_data) != 4 and $read_ok != 0) {
-    $read_ok      = sysread ( $stdin_fh, my $data, 4 - length($header_data) );
+  while ( length($header_data) != 5 and $read_ok != 0) {
+    $read_ok      = sysread ( $stdin_fh, my $data, 5 - length($header_data) );
     $header_data .= $data;
   }
-  if ( length( $header_data ) == 4  ) {
+  if ( length( $header_data ) == 5  ) {
     ## that's our length header in simple hex.
     ## very converluted.. clearly join and split can be done in 1 but I tried now for 10 minutes and failed so fuck it... so done some crazy shit man.
     ## now we read in the entire block and then decypt it...
     ## we might have to go around and around here to make sure we got all the data...
-    my $length_header = hex( ( join '', split '', unpack 'H*', $header_data  ) );  # crazy!
+    my $encrypt = substr($header_data,0,1);
+    my $length_header = hex( ( join '', split '', unpack 'H*', substr($header_data,1)  ) );  # crazy!
     my $data = ''; ## ? good?? dunno
     while ( length($data) != $length_header ) {
       if ( $read_ok  = sysread ( $stdin_fh, my $tdata, ($length_header - length($data)) ) ) {
@@ -45,7 +49,8 @@ while ( $read_ok != 0 ) {
       }
     }
     ($next_s, $data) = gVault::gdecrypt ($vault_name, $data, $next_s) or die "I need a doctor.\n";
-    print STDOUT $data if defined $data;
+    print STDOUT $data             if defined $data and not $encrypt;
+    print STDOUT uncompress($data) if defined $data and     $encrypt;
   }
   elsif ( $read_ok == 0  and  length($header_data) == 0 )   {
     ## that looks like success..
